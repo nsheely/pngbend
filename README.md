@@ -6,6 +6,8 @@
 
 An interactive editor for the DEFLATE bits inside a PNG file. Click a pixel to see which literal or LZ77 back-reference produced each byte; swap a literal or redirect a back-reference; save the result as a valid PNG.
 
+![demo](assets/demo.gif)
+
 ## Background
 
 UCNV's [*The Art of PNG Glitch*](https://ucnv.github.io/pnglitch/) covers PNG glitching across multiple stages of the encode pipeline. pngbend works on the compressed DEFLATE data inside IDAT chunks, replacing random byte hits with same-width Huffman codeword swaps that keep the parser aligned.
