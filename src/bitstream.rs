@@ -43,7 +43,12 @@ impl BitReader {
             self.data[byte_idx + 2],
             self.data[byte_idx + 3],
         ]);
-        let result = (val >> (self.pos & 7)) & ((1u32 << n) - 1);
+        // `(1u32 << 32) - 1` overflows `u32` (panics in debug, returns 0
+        // in release). Special-case `n == 32` to use the full `u32` mask
+        // — for byte-aligned reads that recovers the full value, which
+        // was previously silently dropped to 0.
+        let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+        let result = (val >> (self.pos & 7)) & mask;
         self.pos += n as usize;
         result
     }
@@ -63,7 +68,8 @@ impl BitReader {
             self.data[byte_idx + 2],
             self.data[byte_idx + 3],
         ]);
-        (val >> (self.pos & 7)) & ((1u32 << n) - 1)
+        let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+        (val >> (self.pos & 7)) & mask
     }
 
     /// Advance the read position by `n` bits.
@@ -173,5 +179,23 @@ mod tests {
         assert_eq!(reader.bit_pos(), 8);
         reader.align_to_byte();
         assert_eq!(reader.bit_pos(), 8); // already aligned
+    }
+
+    /// Regression: pre-fix `read_bits(32)` computed `(1u32 << 32) - 1`
+    /// which panics in debug and silently returns 0 in release. The
+    /// fix special-cases `n == 32` to use `u32::MAX`. The byte-aligned
+    /// path is exercised here (the only case the previous code could
+    /// have got right with a 32-bit window).
+    #[test]
+    fn read_bits_32_round_trips_full_u32() {
+        // BitReader reads LSB-first within each byte, so a byte-aligned
+        // 32-bit read must reconstruct the underlying little-endian
+        // u32 exactly.
+        let mut buf = vec![0u8; 8];
+        buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let mut reader = BitReader::new(&buf);
+        assert_eq!(reader.peek_bits(32), 0xDEAD_BEEF);
+        assert_eq!(reader.read_bits(32), 0xDEAD_BEEF);
+        assert_eq!(reader.bit_pos(), 32);
     }
 }

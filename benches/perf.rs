@@ -23,14 +23,14 @@ fn sample_raw() -> Vec<u8> {
 
 fn sample_deflate() -> Vec<u8> {
     let raw = sample_raw();
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("chunks");
     let idat = concat_idat(&chunks);
     idat[2..idat.len() - 4].to_vec()
 }
 
 fn sample_info() -> PngInfo {
     let raw = sample_raw();
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("chunks");
     parse_ihdr(&chunks).expect("parse ihdr")
 }
 
@@ -38,7 +38,7 @@ fn bench_decode_deflate(c: &mut Criterion) {
     let deflate = sample_deflate();
     c.bench_function("decode_deflate/sample", |b| {
         b.iter(|| {
-            let decoded = decode_deflate(black_box(&deflate)).expect("decode");
+            let decoded = decode_deflate(black_box(&deflate), None).expect("decode");
             black_box(decoded.output.len());
         });
     });
@@ -46,7 +46,7 @@ fn bench_decode_deflate(c: &mut Criterion) {
 
 fn bench_build_reverse_graph(c: &mut Criterion) {
     let deflate = sample_deflate();
-    let decoded = decode_deflate(&deflate).expect("decode");
+    let decoded = decode_deflate(&deflate, None).expect("decode");
     c.bench_function("build_reverse_graph/sample", |b| {
         b.iter(|| {
             let rg = build_reverse_graph(black_box(&decoded.events), decoded.output.len());
@@ -57,7 +57,7 @@ fn bench_build_reverse_graph(c: &mut Criterion) {
 
 fn bench_cascade_bfs(c: &mut Criterion) {
     let deflate = sample_deflate();
-    let decoded = decode_deflate(&deflate).expect("decode");
+    let decoded = decode_deflate(&deflate, None).expect("decode");
     let rev = build_reverse_graph(&decoded.events, decoded.output.len());
 
     // Seed the BFS with a handful of positions near the start — this
@@ -91,7 +91,7 @@ fn bench_composite_rgba(c: &mut Criterion) {
 
 fn bench_build_pos_to_ev(c: &mut Criterion) {
     let deflate = sample_deflate();
-    let decoded = decode_deflate(&deflate).expect("decode");
+    let decoded = decode_deflate(&deflate, None).expect("decode");
     c.bench_function("build_pos_to_ev/sample", |b| {
         b.iter(|| {
             let p = build_pos_to_ev(black_box(&decoded.events), decoded.output.len());
@@ -102,7 +102,7 @@ fn bench_build_pos_to_ev(c: &mut Criterion) {
 
 fn bench_parse_ihdr(c: &mut Criterion) {
     let raw = sample_raw();
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("chunks");
     c.bench_function("parse_ihdr/sample", |b| {
         b.iter(|| {
             let info = parse_ihdr(black_box(&chunks)).expect("parse");
@@ -117,7 +117,7 @@ fn bench_parse_ihdr(c: &mut Criterion) {
 /// here gives the per-pixel coefficient most pinches show up in.
 fn bench_build_pixel_index(c: &mut Criterion) {
     let deflate = sample_deflate();
-    let decoded = decode_deflate(&deflate).expect("decode");
+    let decoded = decode_deflate(&deflate, None).expect("decode");
     let info = sample_info();
     let geom = ImgGeom::new(info.width, info.height, info.bpp as u32);
     let pos_to_ev = build_pos_to_ev(&decoded.events, decoded.output.len());

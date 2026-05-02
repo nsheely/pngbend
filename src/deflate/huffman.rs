@@ -37,7 +37,15 @@ impl HuffmanTable {
 /// Build a canonical Huffman table from per-symbol code lengths. Returns the
 /// decoder LUT alongside the encoder side table. Empty input yields an empty
 /// table — check via [`HuffmanTable::is_empty`].
-pub fn build_tree(lengths: &[u32]) -> (HuffmanTable, EncTable) {
+///
+/// Validates the Kraft-McMillan inequality before building: an
+/// over-subscribed length set silently corrupts the LUT (later symbols
+/// overwrite slots assigned to earlier ones), and an under-subscribed
+/// set leaves valid peek patterns with no symbol — both fail loudly here
+/// instead. The single-symbol/single-bit degenerate code allowed by
+/// RFC 1951 §3.2.2 (used when only one distance is referenced) is the
+/// one exception.
+pub fn build_tree(lengths: &[u32]) -> Result<(HuffmanTable, EncTable), DecodeError> {
     let max_bits = lengths
         .iter()
         .filter(|&&b| b > 0)
@@ -45,13 +53,45 @@ pub fn build_tree(lengths: &[u32]) -> (HuffmanTable, EncTable) {
         .copied()
         .unwrap_or(0) as u8;
     if max_bits == 0 {
-        return (
+        return Ok((
             HuffmanTable {
                 entries: Vec::new(),
                 max_bits: 0,
             },
             EncTable::new(lengths.len()),
-        );
+        ));
+    }
+    if max_bits > 15 {
+        return Err(DecodeError::HuffmanCodeTooLong { max_bits });
+    }
+
+    // Kraft-McMillan: sum of `2^(max_bits - l_i)` over nonzero lengths
+    // is the number of LUT slots the canonical code claims. Equal to
+    // `2^max_bits` is a complete code; greater is over-subscription
+    // (slot collisions); less is under-subscription, which we accept
+    // only for the single 1-bit code RFC 1951 §3.2.2 permits.
+    let kraft_full: u32 = 1u32 << max_bits;
+    let kraft_used: u32 = lengths
+        .iter()
+        .filter(|&&l| l > 0)
+        .map(|&l| 1u32 << (max_bits as u32 - l))
+        .sum();
+    if kraft_used > kraft_full {
+        return Err(DecodeError::OverSubscribedHuffman {
+            max_bits,
+            expected: kraft_full,
+            actual: kraft_used,
+        });
+    }
+    if kraft_used < kraft_full {
+        let nonzero = lengths.iter().filter(|&&l| l > 0).count();
+        let single_one_bit = nonzero == 1 && max_bits == 1;
+        if !single_one_bit {
+            return Err(DecodeError::UnderSubscribedHuffman {
+                max_bits,
+                actual: kraft_used,
+            });
+        }
     }
 
     // Counts per code length → first canonical code at each length.
@@ -106,7 +146,7 @@ pub fn build_tree(lengths: &[u32]) -> (HuffmanTable, EncTable) {
         }
     }
 
-    (HuffmanTable { entries, max_bits }, enc)
+    Ok((HuffmanTable { entries, max_bits }, enc))
 }
 
 #[inline(always)]
@@ -149,24 +189,21 @@ mod tests {
     use crate::bitstream::write_bits;
 
     #[test]
-    fn empty_lengths_produce_empty_table() {
-        let (tab, enc) = build_tree(&[]);
-        assert!(tab.is_empty());
-        assert!(enc.is_empty());
-    }
-
-    #[test]
-    fn all_zero_lengths_produce_empty_table() {
-        let (tab, enc) = build_tree(&[0, 0, 0, 0]);
-        assert!(tab.is_empty());
-        assert!(enc.is_empty());
+    fn empty_or_all_zero_lengths_produce_empty_table() {
+        // No nonzero lengths → no codes. Both inputs hit the same
+        // `max_bits == 0` early return.
+        for lengths in [&[][..], &[0, 0, 0, 0]] {
+            let (tab, enc) = build_tree(lengths).expect("no codes");
+            assert!(tab.is_empty());
+            assert!(enc.is_empty());
+        }
     }
 
     #[test]
     fn canonical_codes_round_trip_through_decode_sym() {
         // RFC 1951 example: 8 symbols A-H, lengths 3,3,3,3,3,2,4,4
         let lengths = [3u32, 3, 3, 3, 3, 2, 4, 4];
-        let (tab, enc) = build_tree(&lengths);
+        let (tab, enc) = build_tree(&lengths).expect("valid canonical set");
         for (sym, &len) in lengths.iter().enumerate() {
             let (code, clen) = enc.get(sym as u16).expect("sym in enc");
             assert_eq!(clen as u32, len);
@@ -204,11 +241,71 @@ mod tests {
     fn lut_fills_every_short_code_slot() {
         // One symbol with a 2-bit code must occupy all 2^(max-2) = 2 slots
         // in a 4-entry LUT.
-        let (tab, _) = build_tree(&[2, 2, 2, 2]);
+        let (tab, _) = build_tree(&[2, 2, 2, 2]).expect("valid 2-bit set");
         assert_eq!(tab.max_bits(), 2);
         assert_eq!(tab.entries.len(), 4);
         for e in &tab.entries {
             assert_eq!(e.used_bits, 2);
         }
+    }
+
+    #[test]
+    fn rejects_oversubscribed_lengths() {
+        // Three symbols at length 1 — only two 1-bit codewords exist, so
+        // the third would silently overwrite slot 0 if the build wasn't
+        // guarded.
+        let err = build_tree(&[1, 1, 1]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::OverSubscribedHuffman {
+                    max_bits: 1,
+                    expected: 2,
+                    actual: 3,
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_undersubscribed_lengths() {
+        // Two symbols at length 2 — fills two of four slots but leaves
+        // two valid peek patterns with no symbol. RFC 1951's leniency
+        // covers only the one-symbol/one-bit case.
+        let err = build_tree(&[2, 2]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::UnderSubscribedHuffman {
+                    max_bits: 2,
+                    actual: 2,
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_single_one_bit_code() {
+        // RFC 1951 §3.2.2: a distance alphabet with exactly one used
+        // distance is encoded with a single 1-bit code (the other code
+        // is reserved). build_tree must accept this degenerate set.
+        let mut lengths = vec![0u32; 30];
+        lengths[5] = 1;
+        let (tab, enc) = build_tree(&lengths).expect("single 1-bit code");
+        assert_eq!(tab.max_bits(), 1);
+        assert!(!enc.is_empty());
+    }
+
+    #[test]
+    fn rejects_code_length_above_15() {
+        let mut lengths = vec![0u32; 4];
+        lengths[0] = 16;
+        let err = build_tree(&lengths).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::HuffmanCodeTooLong { max_bits: 16 }),
+            "got {err:?}"
+        );
     }
 }

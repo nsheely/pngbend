@@ -53,14 +53,14 @@ fn main() {
 
     // ── Phase 1: initial load ─────────────────────────────────────────
     let t = Instant::now();
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("chunks");
     let info = parse_ihdr(&chunks).expect("ihdr");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
     let phase_chunks = t.elapsed();
 
     let t = Instant::now();
-    let decoded = decode_deflate(&deflate_buf).expect("decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("decode");
     let phase_decode = t.elapsed();
 
     let t = Instant::now();
@@ -244,7 +244,7 @@ fn main() {
             swap.new_code as u32,
             swap.code_len,
         );
-        let decoded = decode_deflate(&deflate_buf).expect("decode after edit");
+        let decoded = decode_deflate(&deflate_buf, None).expect("decode after edit");
         let pos_to_ev = build_pos_to_ev(&decoded.events, decoded.output.len());
         let reverse_graph = build_reverse_graph(&decoded.events, decoded.output.len());
         let _pi = build_pixel_index(
@@ -441,7 +441,7 @@ fn main() {
         let t_bits = t_stage.elapsed();
 
         let t_stage = Instant::now();
-        let decoded_after = decode_deflate(&deflate_buf).expect("decode after edit");
+        let decoded_after = decode_deflate(&deflate_buf, None).expect("decode after edit");
         let t_decode = t_stage.elapsed();
 
         // Rebuild the three index structures. These are fundamentally

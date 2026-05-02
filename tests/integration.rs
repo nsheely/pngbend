@@ -15,7 +15,6 @@ fn sample_path() -> PathBuf {
     let manifest =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set under cargo test");
     PathBuf::from(manifest)
-        .join("..")
         .join("samples")
         .join("checksum_sunset.png")
 }
@@ -43,7 +42,7 @@ fn loads_sample_png_end_to_end() {
         return;
     };
 
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     assert!(!chunks.is_empty(), "no PNG chunks parsed");
     assert!(
         chunks.iter().any(|c| &c.typ == b"IHDR"),
@@ -63,7 +62,7 @@ fn loads_sample_png_end_to_end() {
     assert!(idat.len() > 6, "IDAT too short");
     let deflate = &idat[2..idat.len() - 4];
 
-    let decoded = decode_deflate(deflate).expect("decode deflate");
+    let decoded = decode_deflate(deflate, None).expect("decode deflate");
     let expected_min = info.height as usize * info.row_stride;
     assert_eq!(
         decoded.output.len(),
@@ -105,8 +104,29 @@ fn loads_sample_png_end_to_end() {
 fn malformed_deflate_returns_error_not_panic() {
     // 3 bytes of all-ones — not a valid deflate stream.
     let garbage = vec![0xFFu8; 3];
-    let result = decode_deflate(&garbage);
+    let result = decode_deflate(&garbage, None);
     assert!(result.is_err(), "expected an error from corrupt deflate");
+}
+
+#[test]
+fn crc_corrupted_png_loads_with_warning() {
+    // Glitcher's contract: a PNG whose chunk CRCs aren't refreshed must
+    // still load. Flip a bit in the IHDR CRC of a real sample and
+    // verify read_chunks reports a warning instead of failing.
+    let Some(mut raw) = read_sample_or_skip("crc_corrupted_png_loads_with_warning") else {
+        return;
+    };
+    // Bytes 8..12 are IHDR length (always 13), 12..16 are 'IHDR', 16..29
+    // are the 13 IHDR data bytes, 29..33 are the IHDR CRC. Flip a bit.
+    raw[29] ^= 0x80;
+    let parsed = read_chunks(&raw).expect("CRC mismatch must not fail the parse");
+    assert!(
+        parsed.warnings.iter().any(|w| w.contains("IHDR")),
+        "expected an IHDR CRC warning, got {:?}",
+        parsed.warnings
+    );
+    let info = parse_ihdr(&parsed).expect("IHDR data still parses");
+    assert!(info.width > 0 && info.height > 0);
 }
 
 /// Save round-trip: rebuild a PNG by replacing IDAT with a freshly
@@ -123,12 +143,12 @@ fn save_and_reread_unedited_png_round_trips() {
     let Some(raw) = read_sample_or_skip("save_and_reread_unedited_png_round_trips") else {
         return;
     };
-    let chunks_orig = read_chunks(&raw);
+    let chunks_orig = read_chunks(&raw).expect("read chunks");
     let info = parse_ihdr(&chunks_orig).expect("parse IHDR");
     let idat = concat_idat(&chunks_orig);
     let zlib_header = [idat[0], idat[1]];
     let deflate_buf = idat[2..idat.len() - 4].to_vec();
-    let decoded = decode_deflate(&deflate_buf).expect("decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("decode");
 
     // Same shape as `app::edit::PngBendApp::assemble_png_bytes`: collapse
     // every IDAT into one rebuilt entry, copy other chunks through.
@@ -159,7 +179,7 @@ fn save_and_reread_unedited_png_round_trips() {
     // Re-read the saved bytes and decode again. The output bytes must
     // match the original — anything else means the save chain dropped
     // or corrupted something.
-    let chunks_re = read_chunks(&saved);
+    let chunks_re = read_chunks(&saved).expect("read saved chunks");
     let info_re = parse_ihdr(&chunks_re).expect("re-parse IHDR");
     assert_eq!(info_re.width, info.width);
     assert_eq!(info_re.height, info.height);
@@ -167,7 +187,7 @@ fn save_and_reread_unedited_png_round_trips() {
     let idat_re = concat_idat(&chunks_re);
     assert!(idat_re.len() > 6, "saved IDAT too short");
     let deflate_re = &idat_re[2..idat_re.len() - 4];
-    let decoded_re = decode_deflate(deflate_re).expect("re-decode saved bytes");
+    let decoded_re = decode_deflate(deflate_re, None).expect("re-decode saved bytes");
     assert_eq!(
         decoded_re.output, decoded.output,
         "saved-and-reread output must match original"
@@ -187,11 +207,11 @@ fn incremental_literal_swap_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("incremental_literal_swap_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
-    let decoded = decode_deflate(&deflate_buf).expect("initial decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
     let reverse_graph = build_reverse_graph(&decoded.events, decoded.output.len());
 
     // Find a literal with a same-length swap alternative we can apply.
@@ -232,7 +252,7 @@ fn incremental_literal_swap_matches_full_decode() {
     }
 
     // Authoritative: decode the patched stream from scratch.
-    let reference = decode_deflate(&deflate_buf)
+    let reference = decode_deflate(&deflate_buf, None)
         .expect("patched stream should still decode (same-length Huffman swap)")
         .output;
 
@@ -263,12 +283,12 @@ fn incremental_redirect_unfilter_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("incremental_redirect_unfilter_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     let info = parse_ihdr(&chunks).expect("ihdr");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
-    let decoded = decode_deflate(&deflate_buf).expect("initial decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
 
     // Find a back-ref with at least one valid redirect target via the
     // same helper the app uses, then grab the new Huffman code out of
@@ -305,7 +325,7 @@ fn incremental_redirect_unfilter_matches_full_decode() {
         new_code as u32,
         swap_len,
     );
-    let decoded_after = decode_deflate(&deflate_buf).expect("decode after redirect");
+    let decoded_after = decode_deflate(&deflate_buf, None).expect("decode after redirect");
     let reference = unfilter(&decoded_after.output, &info).expect("reference unfilter");
 
     // Incremental: diff old vs new output starting at `affected_from`,
@@ -366,12 +386,12 @@ fn apply_then_undo_n_literal_swaps_restores_deflate_buf() {
     else {
         return;
     };
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     let idat = concat_idat(&chunks);
     let original_deflate = idat[2..idat.len() - 4].to_vec();
     let mut deflate_buf = original_deflate.clone();
 
-    let decoded = decode_deflate(&deflate_buf).expect("initial decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
 
     // Pick the first 4 swappable literals — distinct events with same-
     // length Huffman alternatives. Mirrors `find_literal_swaps` in the
@@ -433,11 +453,11 @@ fn surgical_redirect_output_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("surgical_redirect_output_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
-    let decoded = decode_deflate(&deflate_buf).expect("initial decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
     let reverse_graph = build_reverse_graph(&decoded.events, decoded.output.len());
 
     // Find a back-ref with a redirect target. Same pattern as the
@@ -491,7 +511,7 @@ fn surgical_redirect_output_matches_full_decode() {
 
     // Authoritative: patch the bitstream + decode from scratch.
     write_bits(&mut deflate_buf, swap_bit, new_code as u32, swap_len);
-    let reference = decode_deflate(&deflate_buf)
+    let reference = decode_deflate(&deflate_buf, None)
         .expect("patched stream should still decode (same-clen redirect)")
         .output;
 
@@ -528,10 +548,10 @@ fn surgical_redirect_apply_undo_round_trip_with_overlap() {
     else {
         return;
     };
-    let chunks = read_chunks(&raw);
+    let chunks = read_chunks(&raw).expect("read chunks");
     let idat = concat_idat(&chunks);
     let deflate_buf = idat[2..idat.len() - 4].to_vec();
-    let decoded = decode_deflate(&deflate_buf).expect("initial decode");
+    let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
     let original_output = decoded.output.clone();
 
     // Find a redirect target where the ref OVERLAPS its destination —

@@ -296,7 +296,12 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
         .iter()
         .map(|de| {
             let raw = de.raw();
-            // DEFLATE: dist clen ≤ 15, DEXT ≤ 13.
+            // DEFLATE: dist alphabet is 0..30, dist clen ≤ 15, DEXT ≤ 13.
+            // Symbols 30/31 are reserved by RFC 1951 — ignore them even
+            // if a fixed-Huffman block's `EncTable` allocates 32 slots,
+            // since `DEXT` is only defined for 0..30.
+            let limit = raw.len().min(30);
+            let raw = &raw[..limit];
             let mut counts = [[0u8; 16]; 16];
             for (sym, &(_, clen)) in raw.iter().enumerate() {
                 if clen == 0 {
@@ -309,7 +314,7 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
             }
             let mut mask: u32 = 0;
             for (sym, &(_, clen)) in raw.iter().enumerate() {
-                if clen == 0 || sym >= 32 {
+                if clen == 0 {
                     continue;
                 }
                 let dext = DEXT[sym] as usize;
@@ -336,12 +341,20 @@ fn compatible_dist_alts<'a>(
     out_pos: u32,
     src_out_pos: u32,
 ) -> Option<impl Iterator<Item = (u8, u32, u32)> + 'a> {
+    // Symbols 30/31 are reserved (RFC 1951) and have no `DEXT`/`DBASE`
+    // entries — refuse them up front rather than panic at the lookup.
+    if (cur_sym as usize) >= DBASE.len() {
+        return None;
+    }
     let (_, cur_clen) = de.get(cur_sym as u16)?;
     let cur_dext = DEXT[cur_sym as usize];
     let distance = out_pos - src_out_pos;
     let extra_val = distance.saturating_sub(DBASE[cur_sym as usize]);
+    // `de.raw()` may run to 32 entries for a fixed-Huffman block, but
+    // `DBASE`/`DEXT` are only defined for 0..30 — clip the iteration.
+    let limit = de.raw().len().min(DBASE.len());
     Some(
-        de.raw()
+        de.raw()[..limit]
             .iter()
             .enumerate()
             .filter_map(move |(sym, &(_, clen))| {
@@ -440,6 +453,20 @@ mod tests {
             expected[sym as usize] = true;
         }
         assert_eq!(got[0], expected);
+    }
+
+    #[test]
+    fn precompute_dist_redir_ignores_reserved_symbols_30_31() {
+        // Fixed-Huffman blocks build a 32-slot dist EncTable. Symbols 30
+        // and 31 are reserved (RFC 1951) and have no `DEXT`/`DBASE`
+        // entries — the precompute must skip them rather than panic.
+        let mut de = EncTable::new(32);
+        for sym in 0u16..32 {
+            de.set(sym, sym, 5);
+        }
+        let masks = precompute_redirectable_dist_syms(&[de]);
+        // No bits set above sym=29.
+        assert_eq!(masks[0] & !((1u32 << 30) - 1), 0);
     }
 
     #[test]

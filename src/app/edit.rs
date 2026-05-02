@@ -26,6 +26,7 @@
 use crate::bitstream::{read_bits_at, write_bits};
 use crate::deflate::Event;
 use crate::index::event_at;
+use crate::png::ColorType;
 
 use super::PngBendApp;
 use super::io::CoreData;
@@ -78,16 +79,22 @@ impl PngBendApp {
         let Some(action) = self.sel.pending_edit.take() else {
             return;
         };
+        self.sel.selected_edit = None;
+        if !self.is_editable() {
+            self.status = self.read_only_status();
+            return;
+        }
         self.status = format!("Applied: {}  at {:?}", action.label, self.sel.sel_pixel);
         let inverse = self.apply_and_capture_inverse(action);
         self.doc.history.record(inverse);
-
         self.doc.dirty = true;
-        self.sel.pending_edit = None;
-        self.sel.selected_edit = None;
     }
 
     pub(super) fn undo(&mut self) {
+        if !self.is_editable() {
+            self.status = self.read_only_status();
+            return;
+        }
         let Some(entry) = self.doc.history.pop_undo() else {
             return;
         };
@@ -103,6 +110,10 @@ impl PngBendApp {
     }
 
     pub(super) fn redo(&mut self) {
+        if !self.is_editable() {
+            self.status = self.read_only_status();
+            return;
+        }
         let Some(entry) = self.doc.history.pop_redo() else {
             return;
         };
@@ -115,6 +126,30 @@ impl PngBendApp {
             self.doc.history.undo_len(),
             self.doc.history.redo_len()
         );
+    }
+
+    fn is_editable(&self) -> bool {
+        self.doc.core.as_ref().is_some_and(|c| c.editable)
+    }
+
+    /// Status text shown when an edit is attempted on a file pngbend
+    /// can display but not yet edit. Names the actual colour mode so
+    /// the user knows which kind of PNG to avoid (or convert from).
+    fn read_only_status(&self) -> String {
+        let Some(c) = self.doc.core.as_ref() else {
+            return "Read-only.".to_string();
+        };
+        let kind = match c.info.color_type {
+            ColorType::Greyscale => "greyscale",
+            ColorType::Rgb => "RGB",
+            ColorType::Indexed => "indexed-colour",
+            ColorType::GreyAlpha => "greyscale + alpha",
+            ColorType::Rgba => "RGBA",
+        };
+        format!(
+            "Read-only: {}-bit {kind} PNGs aren't supported for editing yet — only 8/16-bit RGB, RGBA, greyscale, greyscale+alpha, and 8-bit indexed.",
+            c.info.bit_depth
+        )
     }
 
     /// Execute `action` and return an [`EditAction`] that inverts it,
@@ -261,7 +296,7 @@ impl PngBendApp {
                 self.refresh_selection_after_literal_swap();
             }
             Err(e) => {
-                self.status = format!("render after edit: {e}");
+                self.status = format!("Couldn't redraw after edit: {e}");
             }
         }
     }
@@ -390,7 +425,7 @@ impl PngBendApp {
                 self.view.texture_dirty = true;
             }
             Err(e) => {
-                self.status = format!("render after redirect: {e}");
+                self.status = format!("Couldn't redraw after edit: {e}");
             }
         }
 

@@ -13,7 +13,8 @@ use crate::coords::ImgGeom;
 use crate::deflate::{DecodeError, DecodedDeflate, decode_deflate};
 use crate::index::{build_pixel_index, build_pos_to_ev, build_reverse_graph};
 use crate::png::{
-    Chunk, PaletteEntry, PngInfo, concat_idat, decode_palette, parse_ihdr, read_chunks,
+    Chunk, ChunksError, PaletteEntry, PngInfo, ZlibError, adler32, concat_idat, decode_palette,
+    parse_ihdr, parse_zlib_stream, read_chunks,
 };
 
 use super::super::PngBendApp;
@@ -29,6 +30,9 @@ pub(crate) struct LoadedFile {
     pub deflate_buf: Vec<u8>,
     pub core: CoreData,
     pub base_rgba: Vec<u8>,
+    /// Integrity warnings collected during load (stale CRCs, FCHECK,
+    /// Adler-32). Shown in the status bar; not a load failure.
+    pub warnings: Vec<String>,
 }
 
 /// Structured errors surfaced by the background load thread.
@@ -37,13 +41,17 @@ pub enum LoadError {
     Io(std::io::Error),
     MissingIhdr,
     MissingIdat,
+    Chunks(ChunksError),
+    Zlib(ZlibError),
     Deflate(DecodeError),
-    Display(String),
-    /// Image hits a data-structure limit the editor can't represent —
-    /// width or height beyond `u16::MAX`, or unfiltered output size beyond
-    /// `u32::MAX`. Both come from in-memory layout choices (PixelRow packs
-    /// xy as `(u16, u16)`; event positions are `u32`) so the loader has
-    /// to refuse rather than silently truncate.
+    /// Display pipeline failed — both the in-app converter and the
+    /// `image`-crate fallback couldn't produce an RGBA buffer. The
+    /// underlying error text isn't surfaced to the user (it's not
+    /// actionable for them); the variant exists so the loader can fail
+    /// distinctly from `Deflate` / `Chunks` etc.
+    Display,
+    /// Width/height past `u16::MAX` or unfiltered output past `u32::MAX`
+    /// — limits set by `PixelRow.xy: (u16, u16)` and `u32` event positions.
     Unsupported {
         width: u32,
         height: u32,
@@ -56,19 +64,46 @@ pub enum LoadError {
 /// silently overflow into another pixel's slot.
 pub const MAX_DIMENSION: u32 = u16::MAX as u32;
 
+/// User-facing message — this Display is what the status bar shows.
+/// The inner [`ChunksError`] / [`ZlibError`] / [`DecodeError`] keep
+/// their technical Display impls for library users and logs; this layer
+/// translates them into something a person opening a PNG can act on.
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "I/O: {e}"),
-            Self::MissingIhdr => write!(f, "missing IHDR chunk"),
-            Self::MissingIdat => write!(f, "no IDAT data"),
-            Self::Deflate(e) => write!(f, "deflate: {e}"),
-            Self::Display(s) => write!(f, "display: {s}"),
+            Self::Io(e) => write!(f, "Couldn't read file: {e}"),
+            Self::MissingIhdr => write!(f, "This file isn't a valid PNG (no header)."),
+            Self::MissingIdat => write!(f, "This PNG has no image data."),
+            Self::Chunks(e) => match e {
+                ChunksError::MissingSignature => write!(f, "This file isn't a PNG."),
+                ChunksError::Truncated => write!(f, "This PNG is truncated."),
+            },
+            Self::Zlib(e) => match e {
+                ZlibError::Truncated { .. } => write!(f, "This PNG's image data is truncated."),
+                ZlibError::BadCompressionMethod { .. } => {
+                    write!(f, "This PNG uses an unrecognised compression method.")
+                }
+                ZlibError::FdictSet => write!(
+                    f,
+                    "This PNG uses a feature pngbend doesn't support (preset dictionary)."
+                ),
+            },
+            Self::Deflate(e) => match e {
+                DecodeError::OutputTooLarge { .. } => write!(
+                    f,
+                    "This PNG decompresses to more data than its dimensions claim — possibly a decompression bomb."
+                ),
+                _ => write!(f, "This PNG's compressed image data is corrupted."),
+            },
+            Self::Display => write!(f, "Couldn't render this PNG."),
             Self::Unsupported {
                 width,
                 height,
                 reason,
-            } => write!(f, "{width}×{height} unsupported: {reason}"),
+            } => write!(
+                f,
+                "This PNG is too big for pngbend ({width}×{height}: {reason})."
+            ),
         }
     }
 }
@@ -77,6 +112,8 @@ impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Chunks(e) => Some(e),
+            Self::Zlib(e) => Some(e),
             Self::Deflate(e) => Some(e),
             _ => None,
         }
@@ -131,7 +168,10 @@ pub(in crate::app) fn peek_ihdr(path: &std::path::Path) -> Option<PngInfo> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut buf = [0u8; 64];
     let n = f.read(&mut buf).ok()?;
-    parse_ihdr(&read_chunks(&buf[..n]))
+    // 64-byte sniffs may straddle the IHDR CRC; if `read_chunks` rejects
+    // a truncated tail that's a peek-only failure, not a load failure, so
+    // treat any chunks error as "no preview, fall through to full load."
+    parse_ihdr(&read_chunks(&buf[..n]).ok()?)
 }
 
 impl PngBendApp {
@@ -204,8 +244,14 @@ impl PngBendApp {
         self.rebuild_filter();
 
         if let Some(ref c) = self.doc.core {
+            let mode = if c.editable { "" } else { "  |  read-only" };
+            let warn = if loaded.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("  |  warning: {}", loaded.warnings.join("; "))
+            };
             self.status = format!(
-                "Loaded {}  |  {}×{}  bpp={}  blocks={}  literals={}  backrefs={} w/redirects",
+                "Loaded {}  |  {}×{}  bpp={}  blocks={}  literals={}  backrefs={} w/redirects{mode}{warn}",
                 loaded.path.display(),
                 c.geom.w,
                 c.geom.h,
@@ -220,7 +266,9 @@ impl PngBendApp {
 
 fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     let raw = std::fs::read(&path).map_err(LoadError::Io)?;
-    let chunks = read_chunks(&raw);
+    let mut parsed = read_chunks(&raw).map_err(LoadError::Chunks)?;
+    let mut warnings = std::mem::take(&mut parsed.warnings);
+    let chunks = parsed.chunks;
     let info = parse_ihdr(&chunks).ok_or(LoadError::MissingIhdr)?;
     if info.width > MAX_DIMENSION || info.height > MAX_DIMENSION {
         return Err(LoadError::Unsupported {
@@ -255,31 +303,50 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     });
 
     let idat = concat_idat(&chunks);
-    if idat.len() < 6 {
+    if idat.is_empty() {
         return Err(LoadError::MissingIdat);
     }
-    let zlib_header = [idat[0], idat[1]];
-    let deflate_buf = idat[2..idat.len() - 4].to_vec();
+    // Hard errors here are the cases where slicing would land on the
+    // wrong bytes (truncation, non-deflate CM, FDICT). FCHECK and the
+    // Adler-32 trailer are checksums and surface as warnings instead.
+    let mut zlib = parse_zlib_stream(&idat).map_err(LoadError::Zlib)?;
+    warnings.append(&mut zlib.warnings);
+    let zlib_header = zlib.header;
+    let stored_adler = zlib.stored_adler;
+    let deflate_buf = zlib.deflate_buf.to_vec();
 
-    let decoded = decode_deflate(&deflate_buf).map_err(LoadError::Deflate)?;
+    // Cap inflated size at the IHDR-derived expected output. RFC 2083:
+    // a well-formed IDAT decodes to exactly `h * (1 + w * bpp)` bytes.
+    // Rejecting anything past that defends against decompression-bomb
+    // PNGs whose tiny IDATs would expand to gigabytes.
+    let decoded =
+        decode_deflate(&deflate_buf, Some(output_bytes as usize)).map_err(LoadError::Deflate)?;
+    if stored_adler != adler32(&decoded.output) {
+        warnings.push("stale checksum on PNG image data".to_string());
+    }
     let geom = ImgGeom::new(w as u32, h as u32, bpp as u32);
 
     // Try the in-app filter unfilter + RGBA converter first; fall back to
     // the image crate for sub-byte depths or other unsupported color types.
     // The unfiltered buffer is kept on `CoreData` across the session so
-    // incremental edits can update only the rows they touched.
+    // incremental edits can update only the rows they touched. Track
+    // whether the in-app pipeline owned the display: if the fallback ran
+    // the file is read-only (the row-scoped re-render path asserts
+    // `unfiltered.len() == h * row_bytes`, which the fallback can't
+    // satisfy without re-implementing every PNG colour mode).
     let unfiltered = crate::png::unfilter(&decoded.output, &info).unwrap_or_default();
-    let base_rgba = if unfiltered.is_empty() {
-        fallback_rgba(&raw)?
+    let (base_rgba, editable) = if unfiltered.is_empty() {
+        (fallback_rgba(&raw)?, false)
     } else {
         match crate::png::to_rgba8(&unfiltered, &info, palette.as_deref()) {
-            Ok(r) => r,
-            Err(_) => fallback_rgba(&raw)?,
+            Ok(r) => (r, true),
+            Err(_) => (fallback_rgba(&raw)?, false),
         }
     };
 
     let mut core = build_core_from_decoded(decoded, info, palette, geom);
     core.unfiltered = unfiltered;
+    core.editable = editable;
 
     // Drop the IDAT bytes inside `chunks`: `deflate_buf` already holds the
     // decompressed source of truth, and save_png re-emits a fresh IDAT
@@ -293,6 +360,7 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     Ok(LoadedFile {
         path,
         chunks,
+        warnings,
         zlib_header,
         deflate_buf,
         core,
@@ -343,6 +411,9 @@ pub(in crate::app) fn build_core_from_decoded(
         reverse_graph,
         unfiltered: Vec::new(),
         max_distance,
+        // Caller overwrites this once it knows whether the in-app
+        // pipeline or the image-crate fallback drove the display.
+        editable: true,
     }
 }
 
@@ -351,5 +422,5 @@ pub(in crate::app) fn build_core_from_decoded(
 fn fallback_rgba(raw: &[u8]) -> Result<Vec<u8>, LoadError> {
     image::load_from_memory(raw)
         .map(|img| img.into_rgba8().into_raw())
-        .map_err(|e| LoadError::Display(e.to_string()))
+        .map_err(|_| LoadError::Display)
 }
