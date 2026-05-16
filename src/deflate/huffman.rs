@@ -11,7 +11,7 @@ use super::error::DecodeError;
 use super::events::EncTable;
 
 #[derive(Debug, Clone)]
-pub struct HuffmanTable {
+pub(super) struct HuffmanTable {
     entries: Vec<LutEntry>,
     /// The width peeked on every decode.
     max_bits: u8,
@@ -24,19 +24,10 @@ struct LutEntry {
     used_bits: u8,
 }
 
-impl HuffmanTable {
-    pub fn is_empty(&self) -> bool {
-        self.max_bits == 0
-    }
-
-    pub fn max_bits(&self) -> u8 {
-        self.max_bits
-    }
-}
-
-/// Build a canonical Huffman table from per-symbol code lengths. Returns the
-/// decoder LUT alongside the encoder side table. Empty input yields an empty
-/// table — check via [`HuffmanTable::is_empty`].
+/// Build a canonical Huffman table from per-symbol code lengths. Returns
+/// the decoder LUT alongside the encoder side table. An all-zero / empty
+/// length set yields a table with `max_bits == 0`, which [`decode_sym`]
+/// treats as an empty alphabet.
 ///
 /// Validates the Kraft-McMillan inequality before building: an
 /// over-subscribed length set silently corrupts the LUT (later symbols
@@ -45,7 +36,7 @@ impl HuffmanTable {
 /// instead. The single-symbol/single-bit degenerate code allowed by
 /// RFC 1951 §3.2.2 (used when only one distance is referenced) is the
 /// one exception.
-pub fn build_tree(lengths: &[u32]) -> Result<(HuffmanTable, EncTable), DecodeError> {
+pub(super) fn build_tree(lengths: &[u32]) -> Result<(HuffmanTable, EncTable), DecodeError> {
     let max_bits = lengths
         .iter()
         .filter(|&&b| b > 0)
@@ -194,7 +185,7 @@ mod tests {
         // `max_bits == 0` early return.
         for lengths in [&[][..], &[0, 0, 0, 0]] {
             let (tab, enc) = build_tree(lengths).expect("no codes");
-            assert!(tab.is_empty());
+            assert!(tab.max_bits == 0);
             assert!(enc.is_empty());
         }
     }
@@ -242,7 +233,7 @@ mod tests {
         // One symbol with a 2-bit code must occupy all 2^(max-2) = 2 slots
         // in a 4-entry LUT.
         let (tab, _) = build_tree(&[2, 2, 2, 2]).expect("valid 2-bit set");
-        assert_eq!(tab.max_bits(), 2);
+        assert_eq!(tab.max_bits, 2);
         assert_eq!(tab.entries.len(), 4);
         for e in &tab.entries {
             assert_eq!(e.used_bits, 2);
@@ -294,7 +285,7 @@ mod tests {
         let mut lengths = vec![0u32; 30];
         lengths[5] = 1;
         let (tab, enc) = build_tree(&lengths).expect("single 1-bit code");
-        assert_eq!(tab.max_bits(), 1);
+        assert_eq!(tab.max_bits, 1);
         assert!(!enc.is_empty());
     }
 

@@ -46,10 +46,22 @@ pub struct PngInfo {
     pub height: u32,
     pub bit_depth: u8,
     pub color_type: ColorType,
-    /// Bytes per pixel in the unfiltered stream.
+    /// Bytes per pixel rounded up to whole bytes (PNG spec §9.4: the
+    /// filter-offset bytes-per-pixel, `1` for sub-byte depths).
     pub bpp: usize,
-    /// 1 + width * bpp (the extra byte is the per-row filter type).
+    /// `1 + ceil(width * bits_per_pixel / 8)` — leading filter byte
+    /// plus the row's packed data bytes.
     pub row_stride: usize,
+}
+
+impl PngInfo {
+    /// True bits per pixel: `bit_depth * channels`. 1/2/4 for sub-byte
+    /// modes; 8/16/24/32/48/64 for the byte-aligned ones. The natural
+    /// input to [`crate::coords::ImgGeom::new`].
+    #[inline]
+    pub fn bits_per_pixel(&self) -> u32 {
+        self.bit_depth as u32 * self.color_type.channels()
+    }
 }
 
 const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
@@ -91,7 +103,7 @@ impl std::ops::Deref for ParsedChunks {
 }
 
 /// Returns `true` if `data` begins with the 8-byte PNG signature.
-pub fn verify_png_signature(data: &[u8]) -> bool {
+fn verify_png_signature(data: &[u8]) -> bool {
     data.starts_with(&PNG_SIG)
 }
 
@@ -168,6 +180,11 @@ pub fn parse_ihdr(chunks: &[Chunk]) -> Option<PngInfo> {
     }
     let width = u32::from_be_bytes([ihdr.data[0], ihdr.data[1], ihdr.data[2], ihdr.data[3]]);
     let height = u32::from_be_bytes([ihdr.data[4], ihdr.data[5], ihdr.data[6], ihdr.data[7]]);
+    // PNG spec §11.2.2: "Zero is an invalid value." Reject before any
+    // downstream arithmetic that would divide or multiply by them.
+    if width == 0 || height == 0 {
+        return None;
+    }
     let bit_depth = ihdr.data[8];
     let color_type = ColorType::from_byte(ihdr.data[9])?;
     // PNG spec: compression-method and filter-method must each be 0
@@ -181,14 +198,19 @@ pub fn parse_ihdr(chunks: &[Chunk]) -> Option<PngInfo> {
         return None;
     }
     let channels = color_type.channels() as usize;
-    let bpp = ((channels * bit_depth as usize) / 8).max(1);
+    let bits_per_pixel = channels * bit_depth as usize;
+    // PNG spec §9.4: filter-byte offset uses bytes-per-pixel rounded up
+    // to whole bytes (so 1 for sub-byte depths).
+    let bpp = bits_per_pixel.div_ceil(8).max(1);
+    // Row data bytes round up too — 9 pixels at 1 bit/pixel is 2 bytes.
+    let row_data_bytes = (width as usize * bits_per_pixel).div_ceil(8);
     Some(PngInfo {
         width,
         height,
         bit_depth,
         color_type,
         bpp,
-        row_stride: 1 + width as usize * bpp,
+        row_stride: 1 + row_data_bytes,
     })
 }
 
@@ -302,6 +324,26 @@ mod tests {
             assert!(
                 parse_ihdr(&chunks).is_none(),
                 "IHDR with {short_len} bytes must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_ihdr_rejects_zero_width_or_height() {
+        // PNG spec §11.2.2 requires non-zero width and height.
+        for (w, h) in [(0u32, 1u32), (1, 0), (0, 0)] {
+            let mut data = vec![0u8; 13];
+            data[0..4].copy_from_slice(&w.to_be_bytes());
+            data[4..8].copy_from_slice(&h.to_be_bytes());
+            data[8] = 8;
+            data[9] = 6;
+            let chunks = vec![Chunk {
+                typ: *b"IHDR",
+                data,
+            }];
+            assert!(
+                parse_ihdr(&chunks).is_none(),
+                "{w}×{h} IHDR must be rejected"
             );
         }
     }

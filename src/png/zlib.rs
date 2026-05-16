@@ -1,7 +1,5 @@
 //! zlib wrapping (RFC 1950) around a raw DEFLATE stream.
 
-use crate::deflate::{DecodeError, decode_deflate};
-
 /// Fatal errors from [`parse_zlib_stream`] — cases where the wrapper
 /// bytes won't slice cleanly into a deflate buffer. FCHECK and the
 /// trailing Adler-32 are checksums that surface as warnings instead.
@@ -79,11 +77,6 @@ pub fn build_zlib_stream(deflate_buf: &[u8], header: &[u8], raw: &[u8]) -> Vec<u
     out.extend_from_slice(deflate_buf);
     out.extend_from_slice(&adler.to_be_bytes());
     out
-}
-
-/// Decompress a raw deflate stream (no zlib header/trailer).
-pub fn inflate_raw(deflate: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    Ok(decode_deflate(deflate, None)?.output)
 }
 
 // ── Adler-32 (RFC 1950) ──────────────────────────────────────────────────────

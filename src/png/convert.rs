@@ -1,9 +1,13 @@
 //! Convert unfiltered PNG bytes to `w*h*4` RGBA8 for display.
 //!
-//! Supports the four non-palette color types at 8-bit and 16-bit depth.
-//! Indexed (palette) PNGs are supported at 8-bit with an optional PLTE+tRNS
-//! decoded into a 256-entry palette. Sub-byte (1/2/4 bit) depths return an
-//! error; callers should fall back to `image::load_from_memory` for those.
+//! Covers every PNG colour mode the format defines:
+//! - RGB / RGBA / Greyscale / GreyAlpha at 8-bit and 16-bit depth
+//! - Indexed (palette) at 1, 2, 4, or 8-bit depth
+//! - Greyscale at 1, 2, or 4-bit depth (scaled to 8-bit luma per PNG §13.10)
+//!
+//! Sub-byte depths pack pixels MSB-first within each byte and pad rows
+//! to a whole-byte boundary; the unfilter step runs on bytes regardless
+//! of pixel depth, so this layer just unpacks.
 
 use super::chunks::{ColorType, PngInfo};
 
@@ -17,6 +21,13 @@ pub enum ConvertError {
     TruncatedInput {
         expected: usize,
         actual: usize,
+    },
+    /// Allocating the RGBA buffer would overflow `usize` or exceed
+    /// `u32::MAX` bytes. Returned when callers pass IHDR dimensions
+    /// without the loader's prior dimension check.
+    OutputTooLarge {
+        width: u32,
+        height: u32,
     },
 }
 
@@ -37,6 +48,10 @@ impl std::fmt::Display for ConvertError {
                     "unfiltered input too short: expected {expected}, got {actual}"
                 )
             }
+            Self::OutputTooLarge { width, height } => write!(
+                f,
+                "RGBA output would exceed limit for {width}×{height} image"
+            ),
         }
     }
 }
@@ -46,40 +61,47 @@ impl std::error::Error for ConvertError {}
 /// Palette entry — RGBA, with alpha defaulting to 255 when no tRNS is present.
 pub type PaletteEntry = [u8; 4];
 
-/// Convert unfiltered bytes to `w*h*4` RGBA8.
+/// Verify `unfiltered` has the full `h * (row_stride - 1)` bytes the
+/// row-walking code will read. Shared between [`to_rgba8`] and
+/// [`to_rgba8_rows_into`] so the contract is one definition.
+fn require_full_unfiltered(unfiltered: &[u8], info: &PngInfo) -> Result<(), ConvertError> {
+    let expected = info.height as usize * (info.row_stride - 1);
+    if unfiltered.len() < expected {
+        Err(ConvertError::TruncatedInput {
+            expected,
+            actual: unfiltered.len(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Convert unfiltered bytes to `w*h*4` RGBA8. Rejects pathological
+/// dimensions before allocating (caps at the loader's `u32::MAX`
+/// limit) and pre-checks the unfiltered input length against the
+/// expected `h * (row_stride - 1)` row-data bytes; for sub-byte depths
+/// that's smaller than `n_pixels * bpp` because multiple pixels pack
+/// into a byte.
 pub fn to_rgba8(
     unfiltered: &[u8],
     info: &PngInfo,
     palette: Option<&[PaletteEntry]>,
 ) -> Result<Vec<u8>, ConvertError> {
-    let n_pixels = info.width as usize * info.height as usize;
-    let mut rgba = vec![0u8; n_pixels * 4];
-    to_rgba8_into(unfiltered, info, palette, &mut rgba)?;
-    Ok(rgba)
-}
-
-/// Like [`to_rgba8`] but writes into a pre-allocated `rgba` buffer so
-/// the caller can amortise the `w * h * 4` allocation across reloads.
-pub fn to_rgba8_into(
-    unfiltered: &[u8],
-    info: &PngInfo,
-    palette: Option<&[PaletteEntry]>,
-    rgba: &mut [u8],
-) -> Result<(), ConvertError> {
-    let n_pixels = info.width as usize * info.height as usize;
-    let expected = n_pixels * info.bpp;
-    if unfiltered.len() < expected {
-        return Err(ConvertError::TruncatedInput {
-            expected,
-            actual: unfiltered.len(),
-        });
-    }
+    let total = (info.width as usize)
+        .checked_mul(info.height as usize)
+        .and_then(|p| p.checked_mul(4))
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or(ConvertError::OutputTooLarge {
+            width: info.width,
+            height: info.height,
+        })?;
+    require_full_unfiltered(unfiltered, info)?;
+    let mut rgba = vec![0u8; total];
     let w = info.width as usize;
-    let h = info.height as usize;
-    for y in 0..h {
-        to_rgba8_row_unchecked(unfiltered, info, palette, rgba, y, w)?;
+    for y in 0..info.height as usize {
+        to_rgba8_row_unchecked(unfiltered, info, palette, &mut rgba, y, w)?;
     }
-    Ok(())
+    Ok(rgba)
 }
 
 /// Convert `rows` (in whatever order — typically sorted) from the unfiltered
@@ -92,14 +114,7 @@ pub fn to_rgba8_rows_into(
     rgba: &mut [u8],
     rows: impl IntoIterator<Item = usize>,
 ) -> Result<(), ConvertError> {
-    let n_pixels = info.width as usize * info.height as usize;
-    let expected = n_pixels * info.bpp;
-    if unfiltered.len() < expected {
-        return Err(ConvertError::TruncatedInput {
-            expected,
-            actual: unfiltered.len(),
-        });
-    }
+    require_full_unfiltered(unfiltered, info)?;
     let w = info.width as usize;
     for y in rows {
         to_rgba8_row_unchecked(unfiltered, info, palette, rgba, y, w)?;
@@ -208,6 +223,68 @@ fn to_rgba8_row_unchecked(
                 write_grey(rgba, rgba_base + i * 4, unfiltered[s], unfiltered[s + 2]);
             }
         }
+        // Sub-byte depths: PNG packs MSB-first within each byte, rows
+        // padded to a whole byte. Greyscale values scale to 8-bit luma
+        // via the spec's "value * (255 / (2^bd - 1))" rule (1-bit:
+        // *255, 2-bit: *85, 4-bit: *17). Indexed values index PLTE
+        // directly without scaling.
+        (ColorType::Greyscale, 1) => {
+            let src_base = y * w.div_ceil(8);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 8];
+                let bit = (byte >> (7 - (i % 8))) & 1;
+                write_grey(rgba, rgba_base + i * 4, bit * 255, 255);
+            }
+        }
+        (ColorType::Greyscale, 2) => {
+            let src_base = y * w.div_ceil(4);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 4];
+                let sample = (byte >> ((3 - (i % 4)) * 2)) & 0x3;
+                write_grey(rgba, rgba_base + i * 4, sample * 85, 255);
+            }
+        }
+        (ColorType::Greyscale, 4) => {
+            let src_base = y * w.div_ceil(2);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 2];
+                let sample = (byte >> ((1 - (i % 2)) * 4)) & 0xF;
+                write_grey(rgba, rgba_base + i * 4, sample * 17, 255);
+            }
+        }
+        (ColorType::Indexed, 1) => {
+            let pal = palette.ok_or(ConvertError::MissingPalette)?;
+            let src_base = y * w.div_ceil(8);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 8];
+                let idx = ((byte >> (7 - (i % 8))) & 1) as usize;
+                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let d = rgba_base + i * 4;
+                rgba[d..d + 4].copy_from_slice(&c);
+            }
+        }
+        (ColorType::Indexed, 2) => {
+            let pal = palette.ok_or(ConvertError::MissingPalette)?;
+            let src_base = y * w.div_ceil(4);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 4];
+                let idx = ((byte >> ((3 - (i % 4)) * 2)) & 0x3) as usize;
+                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let d = rgba_base + i * 4;
+                rgba[d..d + 4].copy_from_slice(&c);
+            }
+        }
+        (ColorType::Indexed, 4) => {
+            let pal = palette.ok_or(ConvertError::MissingPalette)?;
+            let src_base = y * w.div_ceil(2);
+            for i in 0..w {
+                let byte = unfiltered[src_base + i / 2];
+                let idx = ((byte >> ((1 - (i % 2)) * 4)) & 0xF) as usize;
+                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let d = rgba_base + i * 4;
+                rgba[d..d + 4].copy_from_slice(&c);
+            }
+        }
         (ct, bd) => {
             return Err(ConvertError::UnsupportedDepth {
                 color_type: ct,
@@ -257,14 +334,16 @@ mod tests {
 
     fn info(w: u32, h: u32, color: ColorType, bit_depth: u8) -> PngInfo {
         let channels = color.channels() as usize;
-        let bpp = ((channels * bit_depth as usize) / 8).max(1);
+        let bits_per_pixel = channels * bit_depth as usize;
+        let bpp = bits_per_pixel.div_ceil(8).max(1);
+        let row_data_bytes = (w as usize * bits_per_pixel).div_ceil(8);
         PngInfo {
             width: w,
             height: h,
             bit_depth,
             color_type: color,
             bpp,
-            row_stride: 1 + w as usize * bpp,
+            row_stride: 1 + row_data_bytes,
         }
     }
 
@@ -312,20 +391,63 @@ mod tests {
     }
 
     #[test]
-    fn sub_byte_depth_unsupported() {
-        // Provide enough bytes so we hit the match arm instead of tripping
-        // the TruncatedInput guard first.
-        let unf = vec![0xFF; 8];
-        let bad = PngInfo {
-            width: 8,
-            height: 1,
-            bit_depth: 1,
-            color_type: ColorType::Greyscale,
-            bpp: 1,
-            row_stride: 2,
-        };
-        let err = to_rgba8(&unf, &bad, None).unwrap_err();
-        assert!(matches!(err, ConvertError::UnsupportedDepth { .. }));
+    fn one_bit_greyscale_unpacks_msb_first() {
+        // One byte 0b10110001 = pixels 1, 0, 1, 1, 0, 0, 0, 1.
+        let unf = vec![0b1011_0001];
+        let out = to_rgba8(&unf, &info(8, 1, ColorType::Greyscale, 1), None).unwrap();
+        let lumas: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(lumas, vec![255, 0, 255, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn two_bit_greyscale_scales_to_eight_bit() {
+        // One byte 0b00_01_10_11 = samples 0, 1, 2, 3 → lumas 0, 85, 170, 255.
+        let unf = vec![0b00_01_10_11];
+        let out = to_rgba8(&unf, &info(4, 1, ColorType::Greyscale, 2), None).unwrap();
+        let lumas: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(lumas, vec![0, 85, 170, 255]);
+    }
+
+    #[test]
+    fn four_bit_greyscale_scales_to_eight_bit() {
+        // One byte 0xA5 → high nibble 0xA → luma 0xAA, low nibble 0x5 → 0x55.
+        let unf = vec![0xA5];
+        let out = to_rgba8(&unf, &info(2, 1, ColorType::Greyscale, 4), None).unwrap();
+        let lumas: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(lumas, vec![0xAA, 0x55]);
+    }
+
+    #[test]
+    fn one_bit_indexed_uses_palette() {
+        // Byte 0b1010_0000, pal[0]=red, pal[1]=blue → R B R B R R R R.
+        let unf = vec![0b1010_0000];
+        let pal = vec![[255, 0, 0, 255], [0, 0, 255, 255]];
+        let out = to_rgba8(&unf, &info(8, 1, ColorType::Indexed, 1), Some(&pal)).unwrap();
+        // First pixel comes from bit 7 (MSB) = 1 → blue.
+        assert_eq!(&out[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&out[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&out[8..12], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn four_bit_indexed_uses_palette() {
+        let unf = vec![0x12];
+        let mut pal = vec![[0, 0, 0, 255]; 16];
+        pal[1] = [10, 20, 30, 255];
+        pal[2] = [40, 50, 60, 255];
+        let out = to_rgba8(&unf, &info(2, 1, ColorType::Indexed, 4), Some(&pal)).unwrap();
+        assert_eq!(&out[0..4], &[10, 20, 30, 255]); // high nibble = 1
+        assert_eq!(&out[4..8], &[40, 50, 60, 255]); // low nibble = 2
+    }
+
+    #[test]
+    fn sub_byte_row_padding_handled() {
+        // 9-pixel 1-bit row → 2 bytes (last byte has 7 padding bits).
+        // Pixels: 1 0 1 0 1 0 1 0 | 1 ? ? ? ? ? ? ?
+        let unf = vec![0b1010_1010, 0b1000_0000];
+        let out = to_rgba8(&unf, &info(9, 1, ColorType::Greyscale, 1), None).unwrap();
+        let lumas: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(lumas, vec![255, 0, 255, 0, 255, 0, 255, 0, 255]);
     }
 
     #[test]

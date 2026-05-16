@@ -27,8 +27,8 @@ use crate::deflate::constants::{DBASE, DEXT};
 use crate::deflate::{EncTable, Event};
 
 /// One row in the pixel-list side panel: image-space coordinates, the
-/// pixel's RGB swatch colour, and whether it has at least one valid edit.
-/// `Copy` is cheap (8 bytes) so call sites can pass it by value.
+/// pixel's RGB swatch colour, and whether at least one valid edit is
+/// available for it. `Copy` is cheap (8 bytes) so call sites pass by value.
 ///
 /// Coordinates are packed as `u16` — image dimensions are capped at
 /// `u16::MAX` at load time, and on a multi-megapixel index this saves
@@ -38,11 +38,15 @@ use crate::deflate::{EncTable, Event};
 pub struct PixelRow {
     xy: (u16, u16),
     pub rgb: [u8; 3],
-    pub editable: bool,
+    /// `true` when this pixel has at least one applicable edit — a
+    /// same-Huffman-width literal swap, or a redirectable back-ref
+    /// alternative. The sidebar greys non-`has_edit` rows out and the
+    /// "Editable only" filter checkbox hides them.
+    pub has_edit: bool,
 }
 
 impl PixelRow {
-    pub fn new(x: u32, y: u32, rgb: [u8; 3], editable: bool) -> Self {
+    pub fn new(x: u32, y: u32, rgb: [u8; 3], has_edit: bool) -> Self {
         debug_assert!(
             x <= u16::MAX as u32 && y <= u16::MAX as u32,
             "PixelRow coordinates must fit in u16",
@@ -50,7 +54,7 @@ impl PixelRow {
         Self {
             xy: (x as u16, y as u16),
             rgb,
-            editable,
+            has_edit,
         }
     }
 
@@ -71,12 +75,14 @@ impl PixelRow {
 }
 
 /// Per-pixel summaries for the "Literals" and "Backrefs" radio buttons.
-/// `n_lit_editable` is counted during build so the sidebar's pixel-count
-/// label doesn't need a second full-scan pass over `lit`.
+/// `n_lit_with_edit` is counted during build so the sidebar's pixel-count
+/// label doesn't need a second full-scan pass over `lit`. Every entry in
+/// `refs` is already filtered to redirectable refs, so each has at least
+/// one applicable edit by construction.
 pub struct PixelIndex {
     pub lit: Vec<PixelRow>,
     pub refs: Vec<PixelRow>,
-    pub n_lit_editable: usize,
+    pub n_lit_with_edit: usize,
 }
 
 /// One literal symbol (0..=255) per slot — `true` if this block's alphabet
@@ -100,7 +106,7 @@ pub fn build_pixel_index(
     let w = geom.w as usize;
     let h = geom.h as usize;
     let bpp = geom.bpp as usize;
-    let stride = geom.row_stride as usize;
+    let pixels_per_byte = geom.pixels_per_byte() as usize;
 
     let lit_swap_syms = precompute_lit_swap_syms(lit_encs);
     let blk_redir_syms = precompute_redirectable_dist_syms(dist_encs);
@@ -121,12 +127,19 @@ pub fn build_pixel_index(
     // workers and stitch the per-row collections back in `y` order so the
     // output `lit` / `refs` stay sorted by `(y, x)` as downstream code
     // (binary search in `select.rs`, merge-sort in `filter_all`) expects.
+    //
+    // At sub-byte depths multiple x-values share one byte (and therefore
+    // one event). Step `x` by `pixels_per_byte` so the list emits one
+    // entry per byte, named by the cluster's first pixel — for ≥ 8-bit
+    // depths `pixels_per_byte == 1` and behaviour is unchanged.
     let per_row: Vec<RowBuckets> = (0..h)
         .into_par_iter()
         .map(|y| {
             let mut buckets = RowBuckets::new(w);
-            for x in 0..w {
-                let base = y * stride + 1 + x * bpp;
+            for x in (0..w).step_by(pixels_per_byte) {
+                let base = geom
+                    .xy_to_out(crate::coords::PixelXY::new(x as u32, y as u32))
+                    .0 as usize;
                 if base >= output.len() {
                     continue;
                 }
@@ -143,13 +156,13 @@ pub fn build_pixel_index(
                     x as u32,
                     y as u32,
                     [r, g, b],
-                    matches!(kind, PixelKind::Lit { editable: true } | PixelKind::Ref),
+                    matches!(kind, PixelKind::Lit { has_swap: true } | PixelKind::Ref),
                 );
 
                 match kind {
-                    PixelKind::Lit { editable } => {
-                        if editable {
-                            buckets.n_lit_editable += 1;
+                    PixelKind::Lit { has_swap } => {
+                        if has_swap {
+                            buckets.n_lit_with_edit += 1;
                         }
                         buckets.lit.push(row);
                     }
@@ -163,17 +176,17 @@ pub fn build_pixel_index(
     let pixel_count = w * h;
     let mut lit = Vec::with_capacity(pixel_count / 4);
     let mut refs = Vec::with_capacity(pixel_count / 4);
-    let mut n_lit_editable = 0usize;
+    let mut n_lit_with_edit = 0usize;
     for b in per_row {
         lit.extend_from_slice(&b.lit);
         refs.extend_from_slice(&b.refs);
-        n_lit_editable += b.n_lit_editable;
+        n_lit_with_edit += b.n_lit_with_edit;
     }
 
     PixelIndex {
         lit,
         refs,
-        n_lit_editable,
+        n_lit_with_edit,
     }
 }
 
@@ -182,7 +195,7 @@ pub fn build_pixel_index(
 struct RowBuckets {
     lit: Vec<PixelRow>,
     refs: Vec<PixelRow>,
-    n_lit_editable: usize,
+    n_lit_with_edit: usize,
 }
 
 impl RowBuckets {
@@ -193,19 +206,26 @@ impl RowBuckets {
         Self {
             lit: Vec::with_capacity(cap),
             refs: Vec::with_capacity(cap),
-            n_lit_editable: 0,
+            n_lit_with_edit: 0,
         }
     }
 }
 
 enum PixelKind {
-    Lit { editable: bool },
+    /// A literal pixel. `has_swap` is true when the block's alphabet
+    /// holds at least one other literal with the same Huffman code
+    /// length — i.e. the byte can be rewritten without disturbing
+    /// bit-alignment.
+    Lit { has_swap: bool },
+    /// A back-reference pixel. The build path only emits this variant
+    /// for refs whose distance has at least one same-width alternative,
+    /// so every `Ref` row is editable by construction.
     Ref,
 }
 
 /// Decide how to classify a pixel given its channel-owning events.
-/// - If any channel is owned by a literal event → `Lit`, and editable if
-///   that literal has a same-length swap alternative.
+/// - If any channel is owned by a literal event → `Lit`, and `has_swap`
+///   if that literal has a same-length swap alternative.
 /// - Else if any channel is owned by a redirectable back-ref → `Ref`.
 /// - Else the pixel is invisible to the side panel.
 #[inline]
@@ -218,7 +238,7 @@ fn classify_pixel(
     redir_event: &[bool],
 ) -> Option<PixelKind> {
     let mut lit_seen = false;
-    let mut lit_editable = false;
+    let mut lit_has_swap = false;
     let mut ref_seen = false;
 
     for ch in 0..bpp {
@@ -237,7 +257,7 @@ fn classify_pixel(
                     .get(lit.block as usize)
                     .is_some_and(|s| s[lit.symbol as usize])
                 {
-                    lit_editable = true;
+                    lit_has_swap = true;
                 }
             }
             Event::Ref(_) => {
@@ -250,7 +270,7 @@ fn classify_pixel(
 
     if lit_seen {
         Some(PixelKind::Lit {
-            editable: lit_editable,
+            has_swap: lit_has_swap,
         })
     } else if ref_seen {
         Some(PixelKind::Ref)

@@ -106,7 +106,7 @@ fn bench_parse_ihdr(c: &mut Criterion) {
     c.bench_function("parse_ihdr/sample", |b| {
         b.iter(|| {
             let info = parse_ihdr(black_box(&chunks)).expect("parse");
-            black_box(ImgGeom::new(info.width, info.height, info.bpp as u32));
+            black_box(ImgGeom::new(info.width, info.height, info.bits_per_pixel()));
         });
     });
 }
@@ -119,7 +119,7 @@ fn bench_build_pixel_index(c: &mut Criterion) {
     let deflate = sample_deflate();
     let decoded = decode_deflate(&deflate, None).expect("decode");
     let info = sample_info();
-    let geom = ImgGeom::new(info.width, info.height, info.bpp as u32);
+    let geom = ImgGeom::new(info.width, info.height, info.bits_per_pixel());
     let pos_to_ev = build_pos_to_ev(&decoded.events, decoded.output.len());
 
     c.bench_function("build_pixel_index/sample", |b| {

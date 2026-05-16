@@ -115,13 +115,23 @@ pub fn make_cascade_overlay_bytes(
         }
     }
 
+    // Each affected byte may cover several pixels (sub-byte depths). Paint
+    // the whole cluster so the overlay reflects the edit's true reach —
+    // for ≥ 8-bit depths the inner loop runs once and matches the simple
+    // one-byte-one-pixel case.
+    let ppb = geom.pixels_per_byte();
     for &pos in cascade.affected {
-        let Some(base) = geom.rgba_index(OutPos(pos)) else {
+        let Some(xy) = geom.out_to_xy(OutPos(pos)) else {
             continue;
         };
+        let cluster_end = (xy.x + ppb).min(geom.w);
         let d = cascade.depth(pos).unwrap_or(0);
         let colour = cascade_colour(d, max_d);
-        rgba[base..base + 4].copy_from_slice(&colour);
+        let row = xy.y as usize;
+        for px in (xy.x as usize)..(cluster_end as usize) {
+            let base = (row * w + px) * 4;
+            rgba[base..base + 4].copy_from_slice(&colour);
+        }
     }
 
     rgba

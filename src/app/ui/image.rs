@@ -22,7 +22,7 @@ impl PngBendApp {
             }
             if self.view.texture.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("Drop a PNG here or use File > Open").size(18.0));
+                    ui.label(RichText::new("Drop a PNG here or use File → Open").size(18.0));
                 });
                 return;
             }
@@ -94,18 +94,17 @@ impl PngBendApp {
                 self.view.texture_dirty = true;
             }
 
-            // Window title with dirty marker. Only send a viewport
-            // command when the title actually changes — egui has no
-            // "did this change?" check internally, so resending every
-            // frame would spam the windowing layer with no-ops.
+            // Window title — "• filename — PNGbend" with the bullet
+            // marking unsaved changes. Only send a viewport command
+            // when the title actually changes; egui has no "did this
+            // change?" check internally, so resending every frame
+            // would spam the windowing layer with no-ops.
             let title = if let Some(ref p) = self.doc.path {
-                format!(
-                    "{}{}  —  Compressed PNG Editor",
-                    p.file_name().unwrap_or_default().to_string_lossy(),
-                    if self.doc.dirty { " •" } else { "" }
-                )
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                let dirty = if self.doc.dirty { "• " } else { "" };
+                format!("{dirty}{name} — PNGbend")
             } else {
-                "Compressed PNG Editor".to_string()
+                "PNGbend".to_string()
             };
             if title != self.last_title {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));

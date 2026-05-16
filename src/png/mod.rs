@@ -8,10 +8,8 @@ pub mod zlib;
 
 pub use chunks::{
     Chunk, ChunksError, ColorType, ParsedChunks, PngInfo, concat_idat, parse_ihdr, read_chunks,
-    verify_png_signature, write_chunks,
+    write_chunks,
 };
-pub use convert::{
-    ConvertError, PaletteEntry, decode_palette, to_rgba8, to_rgba8_into, to_rgba8_rows_into,
-};
-pub use filter::{FilterError, unfilter, unfilter_into, unfilter_rows_into};
-pub use zlib::{ParsedZlib, ZlibError, adler32, build_zlib_stream, inflate_raw, parse_zlib_stream};
+pub use convert::{ConvertError, PaletteEntry, decode_palette, to_rgba8, to_rgba8_rows_into};
+pub use filter::{FilterError, unfilter, unfilter_rows_into};
+pub use zlib::{ParsedZlib, ZlibError, adler32, build_zlib_stream, parse_zlib_stream};

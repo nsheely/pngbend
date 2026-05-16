@@ -133,12 +133,18 @@ impl PngBendApp {
                 let n = c.pixel_index.lit.len();
                 (
                     n,
-                    format!("Literals: {n}  ({} editable)", c.pixel_index.n_lit_editable),
+                    format!(
+                        "Literals: {n}  ({} editable)",
+                        c.pixel_index.n_lit_with_edit
+                    ),
                 )
             }
             PixelType::Ref => {
+                // Every entry in `refs` is editable by construction —
+                // `build_pixel_index` filters out non-redirectable refs —
+                // so an "(N editable)" suffix here would always read "of N".
                 let n = c.pixel_index.refs.len();
-                (n, format!("Backrefs: {n}  (all editable)"))
+                (n, format!("Backrefs: {n}"))
             }
             PixelType::All => {
                 let n = c.pixel_index.lit.len() + c.pixel_index.refs.len();
@@ -161,10 +167,13 @@ impl PngBendApp {
     }
 
     fn ui_filter_controls(&mut self, ui: &mut egui::Ui) {
+        // Hint names every structured shape `FilterSpec::parse` recognises,
+        // ordered by how often they're useful: coords, RGB prefix, then
+        // back-ref metrics. Free text falls back to a substring match.
         let filter_changed = ui
             .add(
                 egui::TextEdit::singleline(&mut self.list.filter_text)
-                    .hint_text("filter  x,y or #hex or dist…"),
+                    .hint_text("filter  x,y · #hex · d=N · len=N"),
             )
             .changed();
         let editable_changed = ui
@@ -218,7 +227,7 @@ impl PngBendApp {
 
                 let bg = Color32::from_rgb(r, g, b);
                 let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-                let fg = if row.editable {
+                let fg = if row.has_edit {
                     if luma < 128.0 {
                         Color32::WHITE
                     } else {
@@ -294,7 +303,13 @@ impl PngBendApp {
     fn ui_pixel_info(&self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.label("Pixel info (click image):");
-            egui::ScrollArea::vertical()
+            // Bi-directional scroll: the channel-detail lines run wider
+            // than the 340 px panel (e.g. "R: LITERAL val=255 block=3
+            // 9-bit  4 swap options" at the default monospace size).
+            // Vertical-only + wrap would mid-break those lines and
+            // shuffle the columns out of alignment, so we let them
+            // extend and provide horizontal scroll instead.
+            egui::ScrollArea::both()
                 .id_salt("info_scroll")
                 .max_height(150.0)
                 .show(ui, |ui| {

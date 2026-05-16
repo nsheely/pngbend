@@ -64,7 +64,7 @@ fn main() {
     let phase_decode = t.elapsed();
 
     let t = Instant::now();
-    let geom = ImgGeom::new(info.width, info.height, info.bpp as u32);
+    let geom = ImgGeom::new(info.width, info.height, info.bits_per_pixel());
     let pos_to_ev = build_pos_to_ev(&decoded.events, decoded.output.len());
     let phase_pos = t.elapsed();
 
@@ -786,7 +786,7 @@ fn run_filter(pi: &PixelIndex, text: &str, editable_only: bool, scratch: &mut St
     let needle: String = text.to_ascii_lowercase();
     let mut count = 0;
     for (i, row) in pi.lit.iter().enumerate() {
-        if editable_only && !row.editable {
+        if editable_only && !row.has_edit {
             continue;
         }
         if !needle.is_empty() {
@@ -808,7 +808,7 @@ fn run_filter(pi: &PixelIndex, text: &str, editable_only: bool, scratch: &mut St
         count += 1;
     }
     for (i, row) in pi.refs.iter().enumerate() {
-        if editable_only && !row.editable {
+        if editable_only && !row.has_edit {
             continue;
         }
         if !needle.is_empty() {

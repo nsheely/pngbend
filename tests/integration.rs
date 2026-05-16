@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use pngbend::bitstream::{read_bits_at, write_bits};
 use pngbend::deflate::{Event, decode_deflate};
 use pngbend::index::{build_pos_to_ev, build_reverse_graph, valid_dist_alts};
-use pngbend::png::{
-    concat_idat, inflate_raw, parse_ihdr, read_chunks, unfilter, unfilter_rows_into,
-};
+use pngbend::png::{concat_idat, parse_ihdr, read_chunks, unfilter, unfilter_rows_into};
 
 fn sample_path() -> PathBuf {
     let manifest =
@@ -94,10 +92,6 @@ fn loads_sample_png_end_to_end() {
 
     let rev = build_reverse_graph(&decoded.events, decoded.output.len());
     assert_eq!(rev.len(), decoded.output.len());
-
-    // inflate_raw returns the same bytes as decoded.output.
-    let inflated = inflate_raw(deflate).expect("inflate_raw");
-    assert_eq!(inflated, decoded.output);
 }
 
 #[test]
@@ -759,4 +753,186 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
         &output[6..18],
         &original[6..18],
     );
+}
+
+// ── Hand-built sub-byte PNG fixtures ──────────────────────────────────────
+//
+// These tests build a minimal-but-valid PNG byte stream in memory (IHDR +
+// optional PLTE + IDAT-as-stored-deflate-block + IEND) and round-trip it
+// through pngbend's full loader. They give us coverage of the 1/2/4-bit
+// greyscale and indexed paths without committing binary fixtures.
+
+use pngbend::png::{Chunk, build_zlib_stream, parse_zlib_stream, to_rgba8, write_chunks};
+
+/// Wrap raw bytes in a single DEFLATE stored block (BFINAL=1, BTYPE=00).
+/// `LEN`/`NLEN` are little-endian per RFC 1951 §3.2.4.
+fn deflate_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + data.len());
+    out.push(0x01); // BFINAL=1 (bit 0), BTYPE=00 (bits 1-2), pad to byte.
+    let len = data.len() as u16;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// Assemble a complete PNG byte stream from raw scanlines (each row is
+/// a filter byte followed by `row_data_bytes` of pixel data) plus an
+/// optional palette. Uses pngbend's own `build_zlib_stream` and
+/// `write_chunks` so the round-trip exercises the matching read paths.
+fn build_png(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    scanlines: &[u8],
+    palette: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut ihdr_data = vec![0u8; 13];
+    ihdr_data[0..4].copy_from_slice(&width.to_be_bytes());
+    ihdr_data[4..8].copy_from_slice(&height.to_be_bytes());
+    ihdr_data[8] = bit_depth;
+    ihdr_data[9] = color_type;
+    // compression_method=0, filter_method=0, interlace_method=0 already zero.
+
+    let deflate = deflate_stored(scanlines);
+    let idat_payload = build_zlib_stream(&deflate, &[0x78, 0x9C], scanlines);
+
+    let mut chunks = vec![Chunk {
+        typ: *b"IHDR",
+        data: ihdr_data,
+    }];
+    if let Some(pal) = palette {
+        chunks.push(Chunk {
+            typ: *b"PLTE",
+            data: pal.to_vec(),
+        });
+    }
+    chunks.push(Chunk {
+        typ: *b"IDAT",
+        data: idat_payload,
+    });
+    chunks.push(Chunk {
+        typ: *b"IEND",
+        data: vec![],
+    });
+    write_chunks(&chunks)
+}
+
+/// Decode a synthetic PNG through pngbend's full loader stack and return
+/// the resulting RGBA8 buffer. The palette is discovered from the PLTE
+/// chunk if present, so test sites pass only the PNG bytes.
+fn round_trip(png: &[u8]) -> Vec<u8> {
+    let parsed = read_chunks(png).expect("chunks");
+    let info = parse_ihdr(&parsed).expect("ihdr");
+    let palette = parsed
+        .iter()
+        .find(|c| &c.typ == b"PLTE")
+        .map(|p| pngbend::png::decode_palette(&p.data, None));
+    let idat = concat_idat(&parsed);
+    let zlib = parse_zlib_stream(&idat).expect("zlib");
+    let decoded = decode_deflate(zlib.deflate_buf, None).expect("deflate");
+    let unfiltered = unfilter(&decoded.output, &info).expect("unfilter");
+    to_rgba8(&unfiltered, &info, palette.as_deref()).expect("rgba")
+}
+
+#[test]
+fn round_trip_8x1_1bit_greyscale() {
+    // Scanline: filter=None (0), 1 data byte 0b1011_0001
+    // → pixels 1, 0, 1, 1, 0, 0, 0, 1 → lumas 255 0 255 255 0 0 0 255.
+    let scanlines = vec![0u8, 0b1011_0001];
+    let png = build_png(8, 1, 1, 0, &scanlines, None);
+    let rgba = round_trip(&png);
+    let lumas: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+    assert_eq!(lumas, vec![255, 0, 255, 255, 0, 0, 0, 255]);
+}
+
+#[test]
+fn round_trip_4x1_2bit_greyscale() {
+    // 2-bit samples 0, 1, 2, 3 packed MSB-first → byte 0b00_01_10_11 = 0x1B.
+    // Scaled lumas: 0, 85, 170, 255.
+    let scanlines = vec![0u8, 0b00_01_10_11];
+    let png = build_png(4, 1, 2, 0, &scanlines, None);
+    let rgba = round_trip(&png);
+    let lumas: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+    assert_eq!(lumas, vec![0, 85, 170, 255]);
+}
+
+#[test]
+fn round_trip_2x1_4bit_greyscale() {
+    // 4-bit samples 0xA (high nibble), 0x5 (low nibble).
+    // Scaled lumas: 0xAA, 0x55.
+    let scanlines = vec![0u8, 0xA5];
+    let png = build_png(2, 1, 4, 0, &scanlines, None);
+    let rgba = round_trip(&png);
+    let lumas: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+    assert_eq!(lumas, vec![0xAA, 0x55]);
+}
+
+#[test]
+fn round_trip_8x1_1bit_indexed() {
+    // 2-colour palette: index 0 = red, index 1 = blue.
+    // Byte 0b1010_0000 → indices 1, 0, 1, 0, 0, 0, 0, 0.
+    let palette = vec![255, 0, 0, 0, 0, 255]; // PLTE is RGB triples.
+    let scanlines = vec![0u8, 0b1010_0000];
+    let png = build_png(8, 1, 1, 3, &scanlines, Some(&palette));
+    let rgba = round_trip(&png);
+    let expected: Vec<u8> = [1u8, 0, 1, 0, 0, 0, 0, 0]
+        .iter()
+        .flat_map(|&i| {
+            if i == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        })
+        .collect();
+    assert_eq!(rgba, expected);
+}
+
+#[test]
+fn round_trip_5x1_1bit_greyscale_width_not_multiple_of_eight() {
+    // 5 pixels at 1 bit each = 5 used bits in 1 byte (3 padding bits).
+    // Bits 1, 0, 1, 0, 1, _, _, _ → byte 0b1010_1000.
+    let scanlines = vec![0u8, 0b1010_1000];
+    let png = build_png(5, 1, 1, 0, &scanlines, None);
+    let rgba = round_trip(&png);
+    let lumas: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+    assert_eq!(lumas, vec![255, 0, 255, 0, 255]);
+    assert_eq!(rgba.len(), 5 * 4);
+}
+
+#[test]
+fn round_trip_5x1_4bit_indexed_odd_width() {
+    // 5 pixels at 4 bits each = 5 nibbles in 3 bytes (1 padding nibble).
+    // Indices 1, 2, 3, 4, 5 → bytes 0x12, 0x34, 0x5_ (low nibble padding).
+    let scanlines = vec![0u8, 0x12, 0x34, 0x50];
+    // 6 palette entries (indices 0..5) — black, then five distinct colours.
+    let palette: Vec<u8> = vec![
+        0, 0, 0, // 0: black
+        10, 0, 0, // 1
+        0, 20, 0, // 2
+        0, 0, 30, // 3
+        40, 40, 0, // 4
+        0, 40, 40, // 5
+    ];
+    let png = build_png(5, 1, 4, 3, &scanlines, Some(&palette));
+    let rgba = round_trip(&png);
+    assert_eq!(rgba[0..4], [10, 0, 0, 255]); // index 1
+    assert_eq!(rgba[4..8], [0, 20, 0, 255]); // index 2
+    assert_eq!(rgba[8..12], [0, 0, 30, 255]); // index 3
+    assert_eq!(rgba[12..16], [40, 40, 0, 255]); // index 4
+    assert_eq!(rgba[16..20], [0, 40, 40, 255]); // index 5
+}
+
+#[test]
+fn round_trip_3x2_1bit_greyscale_multi_row() {
+    // Two rows, 3 pixels each = 1 data byte per row (5 padding bits).
+    // Row 0: 1, 0, 1, _, _, _, _, _ → 0b1010_0000
+    // Row 1: 0, 1, 0, _, _, _, _, _ → 0b0100_0000
+    let scanlines = vec![0u8, 0b1010_0000, 0u8, 0b0100_0000];
+    let png = build_png(3, 2, 1, 0, &scanlines, None);
+    let rgba = round_trip(&png);
+    let lumas: Vec<u8> = rgba.chunks_exact(4).map(|p| p[0]).collect();
+    assert_eq!(lumas, vec![255, 0, 255, 0, 255, 0]);
 }

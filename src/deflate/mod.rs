@@ -13,4 +13,3 @@ mod huffman;
 pub use decoder::{DecodedDeflate, decode_deflate};
 pub use error::DecodeError;
 pub use events::{EncTable, Event, LitEvent, RefEvent};
-pub use huffman::{HuffmanTable, build_tree};

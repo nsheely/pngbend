@@ -23,7 +23,7 @@ use super::CoreData;
 
 /// Full bundle produced by the background loader. Consumed by
 /// [`PngBendApp::on_load_done`] to replace the app's current file state.
-pub(crate) struct LoadedFile {
+pub(in crate::app) struct LoadedFile {
     pub path: PathBuf,
     pub chunks: Vec<Chunk>,
     pub zlib_header: [u8; 2],
@@ -44,11 +44,10 @@ pub enum LoadError {
     Chunks(ChunksError),
     Zlib(ZlibError),
     Deflate(DecodeError),
-    /// Display pipeline failed — both the in-app converter and the
-    /// `image`-crate fallback couldn't produce an RGBA buffer. The
-    /// underlying error text isn't surfaced to the user (it's not
-    /// actionable for them); the variant exists so the loader can fail
-    /// distinctly from `Deflate` / `Chunks` etc.
+    /// Native unfilter or RGBA conversion failed. Distinct from
+    /// `Deflate` / `Chunks` errors so the loader can fail cleanly
+    /// without claiming the input is malformed when really it just
+    /// hit a corner of the spec the converter doesn't model.
     Display,
     /// Width/height past `u16::MAX` or unfiltered output past `u32::MAX`
     /// — limits set by `PixelRow.xy: (u16, u16)` and `u32` event positions.
@@ -183,15 +182,16 @@ impl PngBendApp {
                 estimate_working_set_bytes(info.width, info.height, info.bpp),
             )
         });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         self.status = match est {
             Some((w, h, bytes)) => format!(
-                "Loading {} ({}×{}, ~{} working set)…",
-                path.display(),
-                w,
-                h,
-                format_bytes(bytes),
+                "Loading {name}  ·  {w}×{h}, ~{} working set…",
+                format_bytes(bytes)
             ),
-            None => format!("Loading {}…", path.display()),
+            None => format!("Loading {name}…"),
         };
         let p = path.clone();
         let (tx, rx) = mpsc::channel();
@@ -244,21 +244,26 @@ impl PngBendApp {
         self.rebuild_filter();
 
         if let Some(ref c) = self.doc.core {
-            let mode = if c.editable { "" } else { "  |  read-only" };
+            // Status names the file and its broad shape; per-class
+            // counts (Literals / Backrefs / All) live in the left
+            // panel so the status bar doesn't duplicate them.
+            let name = loaded
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| loaded.path.display().to_string());
             let warn = if loaded.warnings.is_empty() {
                 String::new()
             } else {
-                format!("  |  warning: {}", loaded.warnings.join("; "))
+                format!("  ·  warning: {}", loaded.warnings.join("; "))
             };
             self.status = format!(
-                "Loaded {}  |  {}×{}  bpp={}  blocks={}  literals={}  backrefs={} w/redirects{mode}{warn}",
-                loaded.path.display(),
+                "Loaded {name}  ·  {}×{}, bpp={}, {} DEFLATE block{}{warn}",
                 c.geom.w,
                 c.geom.h,
                 c.geom.bpp,
                 c.num_blocks,
-                c.pixel_index.lit.len(),
-                c.pixel_index.refs.len(),
+                if c.num_blocks == 1 { "" } else { "s" },
             );
         }
     }
@@ -291,7 +296,6 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     }
     let w = info.width as usize;
     let h = info.height as usize;
-    let bpp = info.bpp;
 
     // Palette (only present for indexed PNGs; harmless for others).
     let palette = chunks.iter().find(|c| &c.typ == b"PLTE").map(|plte| {
@@ -324,29 +328,19 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     if stored_adler != adler32(&decoded.output) {
         warnings.push("stale checksum on PNG image data".to_string());
     }
-    let geom = ImgGeom::new(w as u32, h as u32, bpp as u32);
+    let geom = ImgGeom::new(w as u32, h as u32, info.bits_per_pixel());
 
-    // Try the in-app filter unfilter + RGBA converter first; fall back to
-    // the image crate for sub-byte depths or other unsupported color types.
-    // The unfiltered buffer is kept on `CoreData` across the session so
-    // incremental edits can update only the rows they touched. Track
-    // whether the in-app pipeline owned the display: if the fallback ran
-    // the file is read-only (the row-scoped re-render path asserts
-    // `unfiltered.len() == h * row_bytes`, which the fallback can't
-    // satisfy without re-implementing every PNG colour mode).
-    let unfiltered = crate::png::unfilter(&decoded.output, &info).unwrap_or_default();
-    let (base_rgba, editable) = if unfiltered.is_empty() {
-        (fallback_rgba(&raw)?, false)
-    } else {
-        match crate::png::to_rgba8(&unfiltered, &info, palette.as_deref()) {
-            Ok(r) => (r, true),
-            Err(_) => (fallback_rgba(&raw)?, false),
-        }
-    };
+    // Unfilter and convert. Both run natively for every PNG colour mode
+    // the spec defines, including sub-byte greyscale and indexed depths,
+    // so an unfilter / convert failure here is a genuine decode error
+    // rather than an "unsupported format" signal.
+    let unfiltered =
+        crate::png::unfilter(&decoded.output, &info).map_err(|_| LoadError::Display)?;
+    let base_rgba = crate::png::to_rgba8(&unfiltered, &info, palette.as_deref())
+        .map_err(|_| LoadError::Display)?;
 
     let mut core = build_core_from_decoded(decoded, info, palette, geom);
     core.unfiltered = unfiltered;
-    core.editable = editable;
 
     // Drop the IDAT bytes inside `chunks`: `deflate_buf` already holds the
     // decompressed source of truth, and save_png re-emits a fresh IDAT
@@ -370,8 +364,7 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
 
 /// Build a fully-indexed [`CoreData`] from a freshly decoded DEFLATE
 /// stream plus geometry and palette. Leaves [`CoreData::unfiltered`]
-/// empty — the caller fills it after deciding whether the in-app
-/// unfilter or the `image`-crate fallback drives the display.
+/// empty — the caller fills it after running the row-filter inverse.
 pub(in crate::app) fn build_core_from_decoded(
     decoded: DecodedDeflate,
     info: PngInfo,
@@ -411,16 +404,5 @@ pub(in crate::app) fn build_core_from_decoded(
         reverse_graph,
         unfiltered: Vec::new(),
         max_distance,
-        // Caller overwrites this once it knows whether the in-app
-        // pipeline or the image-crate fallback drove the display.
-        editable: true,
     }
-}
-
-/// Fallback for PNGs our in-app unfilter+converter can't handle
-/// (sub-byte depths, unusual colour types). Defers to the `image` crate.
-fn fallback_rgba(raw: &[u8]) -> Result<Vec<u8>, LoadError> {
-    image::load_from_memory(raw)
-        .map(|img| img.into_rgba8().into_raw())
-        .map_err(|_| LoadError::Display)
 }

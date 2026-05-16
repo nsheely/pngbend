@@ -298,21 +298,21 @@ fn hex_digit(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    fn row(x: u32, y: u32, editable: bool) -> PixelRow {
-        PixelRow::new(x, y, [0, 0, 0], editable)
+    fn row(x: u32, y: u32, has_edit: bool) -> PixelRow {
+        PixelRow::new(x, y, [0, 0, 0], has_edit)
     }
 
     fn pi() -> PixelIndex {
         PixelIndex {
             lit: vec![row(0, 0, true), row(2, 1, false), row(5, 3, true)],
             refs: vec![row(1, 0, true), row(3, 2, true)],
-            n_lit_editable: 2,
+            n_lit_with_edit: 2,
         }
     }
 
     #[test]
     fn filter_lit_picks_passing_rows() {
-        let v = filter_lit(&pi(), |_f, r| r.editable);
+        let v = filter_lit(&pi(), |_f, r| r.has_edit);
         assert_eq!(v, vec![FilterRef::Lit(0), FilterRef::Lit(2)]);
     }
 
@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn filter_all_filters() {
-        let v = filter_all(&pi(), |_, r| r.editable);
-        // Exclude Lit(1) (editable=false).
+        let v = filter_all(&pi(), |_, r| r.has_edit);
+        // Exclude Lit(1) (has_edit=false).
         assert_eq!(
             v,
             vec![

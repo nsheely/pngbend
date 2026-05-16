@@ -41,8 +41,4 @@ pub(super) struct CoreData {
     /// distance overlay renderer doesn't rescan the event list each time
     /// its cache entry is (re)built.
     pub max_distance: u32,
-    /// False when the in-app unfilter+converter couldn't handle the
-    /// PNG and the loader fell back to the `image` crate; `unfiltered`
-    /// is empty in that case so the row-scoped edit path is unsafe.
-    pub editable: bool,
 }

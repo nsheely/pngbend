@@ -409,7 +409,7 @@ mod tests {
         // Both of those run aground on canonical-Huffman well-formedness.
         // The pragmatic test: drive `decode_huffman_block` directly with
         // a synthetic dist `HuffmanTable` containing only sym=30.
-        use crate::deflate::build_tree;
+        use super::super::huffman::build_tree;
         // Lit alphabet: sym 256 (EOB) and sym 257 (length-3) at clen=1
         // — two 1-bit canonical codes (code 0 and code 1).
         let mut lit_lengths = vec![0u32; 258];

@@ -192,7 +192,7 @@ mod tests {
         // 4×1 RGB image: row_stride = 1 + 4*3 = 13. Filter byte at col 0.
         // A ref covering the whole row (bytes 1..13) should paint all 4
         // pixels exactly once each.
-        let geom = ImgGeom::new(4, 1, 3);
+        let geom = ImgGeom::new(4, 1, 24);
         let mut rgba = vec![0u8; 4 * 4];
         paint_ref_pixels(&mut rgba, 1, 12, &geom, [1, 2, 3, 255]);
         for px in 0..4 {
@@ -205,7 +205,7 @@ mod tests {
     fn paint_ref_pixels_crosses_row_boundary() {
         // 2×2 RGB. row_stride = 7. Ref spans bytes 4..12: last pixel of
         // row 0 + filter + both pixels of row 1.
-        let geom = ImgGeom::new(2, 2, 3);
+        let geom = ImgGeom::new(2, 2, 24);
         let mut rgba = vec![0u8; 2 * 2 * 4];
         paint_ref_pixels(&mut rgba, 4, 8, &geom, [9, 9, 9, 9]);
         // Row 0 pixel 1 should be painted (not pixel 0).
@@ -218,14 +218,14 @@ mod tests {
 
     #[test]
     fn distance_overlay_marks_lit_pixels_white() {
-        let geom = ImgGeom::new(2, 1, 3);
+        let geom = ImgGeom::new(2, 1, 24);
         let rgba = make_distance_overlay_bytes(&[lit(1)], &geom, 1);
         assert_eq!(&rgba[0..4], &[255, 255, 255, 180]);
     }
 
     #[test]
     fn block_overlay_colours_by_block() {
-        let geom = ImgGeom::new(1, 2, 3);
+        let geom = ImgGeom::new(1, 2, 24);
         let rgba = make_block_overlay_bytes(
             &[
                 lit(1),        // row 0 pixel 0, block 0
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn literal_overlay_skips_refs() {
         // A ref at pixel 0 must not be painted green by the literal overlay.
-        let geom = ImgGeom::new(2, 1, 3);
+        let geom = ImgGeom::new(2, 1, 24);
         let rgba = make_literal_overlay_bytes(&[refe(1, 0, 3)], &geom);
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
     }

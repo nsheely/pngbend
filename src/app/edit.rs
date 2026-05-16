@@ -26,11 +26,21 @@
 use crate::bitstream::{read_bits_at, write_bits};
 use crate::deflate::Event;
 use crate::index::event_at;
-use crate::png::ColorType;
 
 use super::PngBendApp;
 use super::io::CoreData;
 use super::select::SelectSource;
+
+/// One bit-precise rewrite in the deflate buffer: `value` is written
+/// into the `code_len` bits starting at `bit_start`. Pairs with
+/// [`apply_patches_capturing_prior`], which returns a Vec of these
+/// describing the inverse rewrite for undo.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Patch {
+    pub bit_start: u32,
+    pub value: u32,
+    pub code_len: u8,
+}
 
 /// The patches + kind needed to apply an edit forward and to derive its
 /// inverse for undo/redo.
@@ -38,7 +48,7 @@ use super::select::SelectSource;
 pub(super) struct EditAction {
     /// Low-level bit writes that realise the edit in the deflate stream.
     /// Always the source of truth for what changes on disk.
-    pub patches: Vec<(u32, u32, u8)>, // (bit_start, new_code, code_len)
+    pub patches: Vec<Patch>,
     pub label: String,
     pub kind: EditKind,
 }
@@ -80,10 +90,6 @@ impl PngBendApp {
             return;
         };
         self.sel.selected_edit = None;
-        if !self.is_editable() {
-            self.status = self.read_only_status();
-            return;
-        }
         self.status = format!("Applied: {}  at {:?}", action.label, self.sel.sel_pixel);
         let inverse = self.apply_and_capture_inverse(action);
         self.doc.history.record(inverse);
@@ -91,10 +97,6 @@ impl PngBendApp {
     }
 
     pub(super) fn undo(&mut self) {
-        if !self.is_editable() {
-            self.status = self.read_only_status();
-            return;
-        }
         let Some(entry) = self.doc.history.pop_undo() else {
             return;
         };
@@ -110,10 +112,6 @@ impl PngBendApp {
     }
 
     pub(super) fn redo(&mut self) {
-        if !self.is_editable() {
-            self.status = self.read_only_status();
-            return;
-        }
         let Some(entry) = self.doc.history.pop_redo() else {
             return;
         };
@@ -126,30 +124,6 @@ impl PngBendApp {
             self.doc.history.undo_len(),
             self.doc.history.redo_len()
         );
-    }
-
-    fn is_editable(&self) -> bool {
-        self.doc.core.as_ref().is_some_and(|c| c.editable)
-    }
-
-    /// Status text shown when an edit is attempted on a file pngbend
-    /// can display but not yet edit. Names the actual colour mode so
-    /// the user knows which kind of PNG to avoid (or convert from).
-    fn read_only_status(&self) -> String {
-        let Some(c) = self.doc.core.as_ref() else {
-            return "Read-only.".to_string();
-        };
-        let kind = match c.info.color_type {
-            ColorType::Greyscale => "greyscale",
-            ColorType::Rgb => "RGB",
-            ColorType::Indexed => "indexed-colour",
-            ColorType::GreyAlpha => "greyscale + alpha",
-            ColorType::Rgba => "RGBA",
-        };
-        format!(
-            "Read-only: {}-bit {kind} PNGs aren't supported for editing yet — only 8/16-bit RGB, RGBA, greyscale, greyscale+alpha, and 8-bit indexed.",
-            c.info.bit_depth
-        )
     }
 
     /// Execute `action` and return an [`EditAction`] that inverts it,
@@ -574,18 +548,23 @@ fn render_affected_rows(
     Ok(rebuilt)
 }
 
-/// Write each `(bit_start, value, code_len)` patch into `buf`, capturing
-/// the bits that were overwritten so the caller can stash the inverse
-/// patch list onto the undo stack.
-fn apply_patches_capturing_prior(
-    buf: &mut [u8],
-    patches: &[(u32, u32, u8)],
-) -> Vec<(u32, u32, u8)> {
+/// Write each patch into `buf`, capturing the bits that were overwritten
+/// so the caller can stash the inverse patch list onto the undo stack.
+fn apply_patches_capturing_prior(buf: &mut [u8], patches: &[Patch]) -> Vec<Patch> {
     let mut inverse = Vec::with_capacity(patches.len());
-    for &(bit_start, value, code_len) in patches {
+    for &Patch {
+        bit_start,
+        value,
+        code_len,
+    } in patches
+    {
         let bs = bit_start as usize;
         let prev = read_bits_at(buf, bs, code_len);
-        inverse.push((bit_start, prev, code_len));
+        inverse.push(Patch {
+            bit_start,
+            value: prev,
+            code_len,
+        });
         write_bits(buf, bs, value, code_len);
     }
     inverse
@@ -593,7 +572,7 @@ fn apply_patches_capturing_prior(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_patches_capturing_prior;
+    use super::{Patch, apply_patches_capturing_prior};
     use proptest::prelude::*;
 
     proptest! {
@@ -610,14 +589,14 @@ mod tests {
         ) {
             let max_bit = buf.len() * 8;
             let mut bit_cursor: u32 = 0;
-            let mut patches: Vec<(u32, u32, u8)> = Vec::new();
+            let mut patches: Vec<Patch> = Vec::new();
             for (cl, v) in specs {
                 let cl_u32 = cl as u32;
                 if (bit_cursor + cl_u32) as usize > max_bit {
                     break;
                 }
                 let mask = if cl == 32 { u32::MAX } else { (1u32 << cl) - 1 };
-                patches.push((bit_cursor, v & mask, cl));
+                patches.push(Patch { bit_start: bit_cursor, value: v & mask, code_len: cl });
                 bit_cursor += cl_u32 + 1;
             }
             prop_assume!(!patches.is_empty());

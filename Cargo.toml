@@ -20,7 +20,6 @@ path = "src/main.rs"
 [dependencies]
 eframe  = "0.34"
 egui    = "0.34"
-image   = { version = "0.25", default-features = false, features = ["png"] }
 rayon   = "1"
 rfd     = "0.17"
 wide    = "0.7"

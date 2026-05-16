@@ -159,7 +159,7 @@ impl PngBendApp {
                 info_text: "Click a pixel to inspect it.".to_string(),
                 ..Default::default()
             },
-            status: "Drop a PNG or use File > Open.".to_string(),
+            status: "Drop a PNG or use File → Open.".to_string(),
             ..Self::default()
         };
         if let Some(p) = path {
@@ -296,7 +296,7 @@ impl PngBendApp {
                 .into_iter()
                 .filter(|&fref| {
                     let row = fref.resolve(pi);
-                    if new_editable && !old_editable && !row.editable {
+                    if new_editable && !old_editable && !row.has_edit {
                         return false;
                     }
                     spec.matches(fref, row, c, &mut scratch)
@@ -305,7 +305,7 @@ impl PngBendApp {
         } else {
             let editable_only = new_editable;
             let predicate = |fref: FilterRef, row: &crate::index::PixelRow| -> bool {
-                if editable_only && !row.editable {
+                if editable_only && !row.has_edit {
                     return false;
                 }
                 spec.matches(fref, row, c, &mut scratch)

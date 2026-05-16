@@ -15,28 +15,42 @@ pub struct BitReader {
     pos: usize,
 }
 
+/// Trailing-zero padding so unaligned `u32` reads at any byte position
+/// up to `data.len()` stay in bounds. We pad generously so a malformed
+/// deflate stream that over-reads past the end still returns zeros
+/// rather than panicking until the calling decoder notices something
+/// is wrong (typically when an unexpected Huffman code surfaces).
+const PEEK_PAD: usize = 8;
+
 impl BitReader {
-    /// Wrap `data` for reading. The internal buffer is padded with three
-    /// trailing zero bytes so an unaligned `u32` read at any valid bit
-    /// position stays in bounds; reads past the actual stream end yield
-    /// zeros rather than panicking.
+    /// Wrap `data` for reading. Reads past the actual stream end yield
+    /// zero bytes — corrupt or truncated input must be detected by
+    /// whichever decoder consumes the bits, not by this reader.
     pub fn new(data: &[u8]) -> Self {
-        let mut padded = Vec::with_capacity(data.len() + 3);
+        let mut padded = Vec::with_capacity(data.len() + PEEK_PAD);
         padded.extend_from_slice(data);
-        padded.extend_from_slice(&[0u8; 3]);
+        padded.extend_from_slice(&[0u8; PEEK_PAD]);
         Self {
             data: padded,
             pos: 0,
         }
     }
 
-    /// Read up to 32 bits, LSB-first within bytes.
+    /// Read up to 32 bits, LSB-first within bytes. Returns zero for any
+    /// bit position that would over-read past the padded buffer — a
+    /// signal to the calling decoder that the stream is truncated /
+    /// malformed (it'll subsequently fail on an invalid Huffman code or
+    /// similar).
     #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
         let byte_idx = self.pos >> 3;
+        if byte_idx + 4 > self.data.len() {
+            self.pos += n as usize;
+            return 0;
+        }
         let val = u32::from_le_bytes([
             self.data[byte_idx],
             self.data[byte_idx + 1],
@@ -55,13 +69,17 @@ impl BitReader {
 
     /// Peek up to 32 bits without advancing. The Huffman decoder uses this
     /// to look up a symbol in a LUT keyed by the next `max_bits`, then
-    /// advances by only the matched code length.
+    /// advances by only the matched code length. Returns zero past the
+    /// padded buffer (see [`read_bits`] for the rationale).
     #[inline(always)]
     pub fn peek_bits(&self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
         let byte_idx = self.pos >> 3;
+        if byte_idx + 4 > self.data.len() {
+            return 0;
+        }
         let val = u32::from_le_bytes([
             self.data[byte_idx],
             self.data[byte_idx + 1],
@@ -197,5 +215,24 @@ mod tests {
         assert_eq!(reader.peek_bits(32), 0xDEAD_BEEF);
         assert_eq!(reader.read_bits(32), 0xDEAD_BEEF);
         assert_eq!(reader.bit_pos(), 32);
+    }
+
+    /// Regression: fuzz discovered a malformed deflate stream that
+    /// over-reads past the buffer end. Earlier code padded with only 3
+    /// trailing zero bytes (one short for an unaligned `u32` read at
+    /// `byte_idx == data.len()`), so the read panicked. New behaviour:
+    /// reads past the padded zone yield zeros, letting the calling
+    /// decoder surface the truncation as a structured error.
+    #[test]
+    fn read_past_end_yields_zero_not_panic() {
+        let buf = vec![0xFFu8; 4];
+        let mut reader = BitReader::new(&buf);
+        // Burn through the real bytes.
+        let _ = reader.read_bits(32);
+        // Each further read should peek 0 and return 0, not panic.
+        for _ in 0..32 {
+            assert_eq!(reader.peek_bits(16), 0);
+            assert_eq!(reader.read_bits(8), 0);
+        }
     }
 }

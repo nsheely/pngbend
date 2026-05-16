@@ -16,7 +16,7 @@ use crate::index::{CascadeScratch, PixelRow, event_at, valid_dist_alts};
 use crate::overlays::{compute_filter_expansion, make_cascade_overlay_bytes};
 
 use super::PngBendApp;
-use super::edit::{EditAction, EditKind};
+use super::edit::{EditAction, EditKind, Patch};
 use super::io::CoreData;
 use super::overlay_cache::OverlayMode;
 
@@ -82,19 +82,26 @@ struct LitPatchSite {
 
 impl PngBendApp {
     pub(super) fn select_pixel(&mut self, x: u32, y: u32, source: SelectSource) {
-        let (sx, sy) = if source.snaps_to_filtered() {
+        let (mut sx, sy) = if source.snaps_to_filtered() {
             self.snap_to_nearest_filtered(x, y)
         } else {
             (x, y)
         };
+        // Snap to the byte's cluster start so the sidebar row, info
+        // text, and cascade highlight all agree on which cluster was
+        // clicked. For ≥ 8-bit depths `pixels_per_byte == 1` and the
+        // arithmetic is a no-op.
+        if let Some(c) = self.doc.core.as_ref() {
+            let ppb = c.geom.pixels_per_byte();
+            sx = (sx / ppb) * ppb;
+        }
         self.reset_edit_state();
         self.sel.sel_pixel = Some((sx, sy));
 
         let Some(c) = self.doc.core.as_ref() else {
             return;
         };
-        let bpp = c.geom.bpp as usize;
-        let base_raw = sy as usize * c.geom.row_stride as usize + 1 + sx as usize * bpp;
+        let base_raw = c.geom.xy_to_out(crate::coords::PixelXY::new(sx, sy)).0 as usize;
         let evs = gather_pixel_events(c, base_raw);
 
         if evs.is_empty() {
@@ -235,6 +242,20 @@ fn build_selection_data(
     };
 
     let mut info_lines = vec![format!("Pixel ({sx}, {sy}){idx_str}")];
+    // Sub-byte PNGs pack several pixels into one byte; warn the user so
+    // they understand a "literal swap" here recolours the whole cluster.
+    // At the right edge of the image the last cluster may be smaller
+    // than `pixels_per_byte` (the trailing bits are padding).
+    let ppb = c.geom.pixels_per_byte();
+    if ppb > 1 {
+        let cluster_end = (sx + ppb).min(c.geom.w);
+        let cluster_size = cluster_end - sx;
+        let last_x = cluster_end - 1;
+        let plural = if cluster_size > 1 { "s" } else { "" };
+        info_lines.push(format!(
+            "  (this byte encodes {cluster_size} pixel{plural} at y={sy}, x={sx}..{last_x} — edits affect all of them)"
+        ));
+    }
     let mut edit_options: Vec<EditOption> = Vec::new();
     let mut cascade_positions: Vec<u32> = Vec::new();
     // Grouped by (symbol, block) so one `EditOption` covers every channel
@@ -331,7 +352,11 @@ fn build_ref_redirect_edits(
                 bg_color: bg,
                 fg_color: contrast_text_color(bg),
                 action: EditAction {
-                    patches: vec![(r.dist_bit_start, new_code as u32, new_len)],
+                    patches: vec![Patch {
+                        bit_start: r.dist_bit_start,
+                        value: new_code as u32,
+                        code_len: new_len,
+                    }],
                     label: format!("redirect dist_sym → {new_dsym}"),
                     kind: EditKind::DistRedirect {
                         out_pos: r.out_pos,
@@ -384,9 +409,13 @@ fn build_lit_swap_edits(
             let label = format!("[{chs}] LITERAL  {val} → {tgt}  (both {clen}-bit)");
             let bg = Color32::from_gray(tgt as u8);
             let fg = Color32::from_gray(255u8.saturating_sub(tgt as u8));
-            let patches: Vec<(u32, u32, u8)> = sites
+            let patches: Vec<Patch> = sites
                 .iter()
-                .map(|s| (s.bit_start, new_code as u32, new_len))
+                .map(|s| Patch {
+                    bit_start: s.bit_start,
+                    value: new_code as u32,
+                    code_len: new_len,
+                })
                 .collect();
             let byte_updates: Vec<(u32, u8)> =
                 sites.iter().map(|s| (s.out_pos, tgt as u8)).collect();

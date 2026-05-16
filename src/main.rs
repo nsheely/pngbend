@@ -4,17 +4,31 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use pngbend::app::PngBendApp;
+use pngbend::deflate::decode_deflate;
+use pngbend::png::{
+    concat_idat, decode_palette, parse_ihdr, parse_zlib_stream, read_chunks, to_rgba8, unfilter,
+};
 
+/// Decode the embedded app-icon PNG through pngbend's own pipeline.
+/// The icon is shipped with the binary so every `expect` here is a
+/// build-time guarantee: a broken `assets/icon.png` would fail CI.
 fn load_icon() -> egui::IconData {
     let bytes = include_bytes!("../assets/icon.png");
-    let image = image::load_from_memory(bytes)
-        .expect("embedded icon should be a valid PNG")
-        .to_rgba8();
-    let (width, height) = image.dimensions();
+    let parsed = read_chunks(bytes).expect("icon chunks");
+    let info = parse_ihdr(&parsed).expect("icon IHDR");
+    let palette = parsed
+        .iter()
+        .find(|c| &c.typ == b"PLTE")
+        .map(|p| decode_palette(&p.data, None));
+    let idat = concat_idat(&parsed);
+    let zlib = parse_zlib_stream(&idat).expect("icon zlib header");
+    let decoded = decode_deflate(zlib.deflate_buf, None).expect("icon deflate");
+    let unfiltered = unfilter(&decoded.output, &info).expect("icon unfilter");
+    let rgba = to_rgba8(&unfiltered, &info, palette.as_deref()).expect("icon RGBA");
     egui::IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
+        rgba,
+        width: info.width,
+        height: info.height,
     }
 }
 

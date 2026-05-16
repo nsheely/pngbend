@@ -14,8 +14,21 @@ use super::chunks::PngInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterError {
-    TruncatedRow { row: usize },
-    UnknownFilter { row: usize, filter: u8 },
+    TruncatedRow {
+        row: usize,
+    },
+    UnknownFilter {
+        row: usize,
+        filter: u8,
+    },
+    /// Allocating the unfiltered buffer would overflow `usize` or
+    /// exceed `u32::MAX` bytes. Returned (rather than aborting on OOM)
+    /// when callers pass IHDR dimensions without the loader's prior
+    /// dimension check.
+    OutputTooLarge {
+        rows: usize,
+        row_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for FilterError {
@@ -25,6 +38,10 @@ impl std::fmt::Display for FilterError {
             Self::UnknownFilter { row, filter } => {
                 write!(f, "unknown filter type {filter} at row {row}")
             }
+            Self::OutputTooLarge { rows, row_bytes } => write!(
+                f,
+                "unfilter output would exceed limit ({rows} rows × {row_bytes} bytes)"
+            ),
         }
     }
 }
@@ -39,18 +56,17 @@ impl std::error::Error for FilterError {}
 pub fn unfilter(stream: &[u8], info: &PngInfo) -> Result<Vec<u8>, FilterError> {
     let h = info.height as usize;
     let row_bytes = info.row_stride - 1;
-    let mut out = vec![0u8; h * row_bytes];
-    unfilter_into(stream, info, &mut out)?;
+    // Reject pathological dimensions before allocating. Cap at u32::MAX
+    // matches the loader's `output_bytes > u32::MAX` check (event
+    // positions are u32). Library callers without that prior check
+    // get a structured error instead of an OOM abort.
+    let total = h
+        .checked_mul(row_bytes)
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or(FilterError::OutputTooLarge { rows: h, row_bytes })?;
+    let mut out = vec![0u8; total];
+    unfilter_rows_into(stream, info, &mut out, 0, |_| true, |_| ())?;
     Ok(out)
-}
-
-/// Like [`unfilter`] but writes into a pre-sized `out` buffer, so the
-/// caller can amortise the `h * row_bytes` allocation across reloads.
-///
-/// Internally [`unfilter_rows_into`] with `changed_row` always true.
-/// Closure-call overhead is negligible on the cold load path.
-pub fn unfilter_into(stream: &[u8], info: &PngInfo, out: &mut [u8]) -> Result<(), FilterError> {
-    unfilter_rows_into(stream, info, out, 0, |_| true, |_| ()).map(|_| ())
 }
 
 /// Re-run the inverse filter for just the rows whose raw bytes changed,
