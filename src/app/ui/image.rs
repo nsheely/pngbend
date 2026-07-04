@@ -22,7 +22,9 @@ impl PngBendApp {
             }
             if self.view.texture.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("Drop a PNG here or use File → Open").size(18.0));
+                    ui.label(
+                        RichText::new("Drop a PNG here, or press Ctrl+O to open one").size(18.0),
+                    );
                 });
                 return;
             }

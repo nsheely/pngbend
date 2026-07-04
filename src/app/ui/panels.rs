@@ -80,10 +80,12 @@ impl PngBendApp {
 
     pub(in crate::app) fn ui_status_bar(&self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show_inside(ui, |ui| {
+            // Monospace so glyphs like `→` (used in edit labels echoed here)
+            // resolve; egui's proportional font renders them as tofu boxes.
             ui.horizontal(|ui| {
-                ui.label(&self.status);
+                ui.label(RichText::new(&self.status).monospace());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(&self.hover_info);
+                    ui.label(RichText::new(&self.hover_info).monospace());
                 });
             });
         });
@@ -271,12 +273,15 @@ impl PngBendApp {
         egui::Panel::right("right_panel")
             .exact_size(340.0)
             .show_inside(ui, |ui| {
-                ui.vertical(|ui| {
-                    self.ui_overlay_selector(ui);
-                    self.ui_pixel_info(ui);
-                    self.ui_edit_list(ui);
+                // Reserve the action buttons at the bottom of the panel
+                // first so a long edit list can never push them under the
+                // window's status bar; the list scrolls in the space above.
+                egui::Panel::bottom("right_actions").show_inside(ui, |ui| {
                     self.ui_action_buttons(ui, &mut clicks);
                 });
+                self.ui_overlay_selector(ui);
+                self.ui_pixel_info(ui);
+                self.ui_edit_list(ui);
             });
         clicks
     }
@@ -291,6 +296,7 @@ impl PngBendApp {
                         .clicked()
                     {
                         self.view.overlay_mode = mode;
+                        self.view.overlay_user_set = true;
                         self.view.texture_dirty = true;
                     }
                 }
@@ -319,8 +325,9 @@ impl PngBendApp {
     }
 
     fn ui_edit_list(&mut self, ui: &mut egui::Ui) {
-        // Cap height so the action buttons below stay visible.
-        let edits_max_h = (ui.available_height() - 40.0).max(60.0);
+        // Fill the space left between the pixel-info group and the reserved
+        // action-button panel; the buttons live in their own bottom panel.
+        let edits_max_h = ui.available_height().max(60.0);
         ui.group(|ui| {
             ui.label("Available edits:");
             egui::ScrollArea::vertical()
@@ -360,7 +367,11 @@ impl PngBendApp {
                                 });
                             })
                             .response
-                            .interact(egui::Sense::click());
+                            .interact(egui::Sense::click())
+                            // The row truncates at the panel width, cutting
+                            // the source/value that distinguishes options;
+                            // the tooltip carries the full label.
+                            .on_hover_text(RichText::new(&label).monospace());
 
                         if r.clicked() {
                             self.sel.selected_edit = Some(i);

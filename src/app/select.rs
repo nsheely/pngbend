@@ -147,10 +147,11 @@ impl PngBendApp {
                 );
                 info_lines.push(summary.text);
                 self.view.cascade_rgba = Some(summary.overlay);
-                // Auto-show the cascade overlay only when the user hasn't
-                // chosen a visualisation yet. Once they pick a mode (even
-                // Cascade explicitly), subsequent clicks preserve it.
-                if matches!(self.view.overlay_mode, OverlayMode::None) {
+                // Auto-show the cascade overlay only until the user picks a
+                // mode from the selector. `overlay_user_set` distinguishes an
+                // explicit `None` from the initial default, which the bare
+                // mode value can't.
+                if !self.view.overlay_user_set {
                     self.view.overlay_mode = OverlayMode::Cascade;
                 }
             }
@@ -201,6 +202,16 @@ impl PngBendApp {
 }
 
 // pure helpers
+
+/// Render an optional pixel position for the UI as `(x, y)`, or `off-image`
+/// when the byte doesn't map to a pixel (a filter byte, or a source that
+/// falls outside the image).
+pub(in crate::app) fn fmt_pixel(p: Option<PixelXY>) -> String {
+    match p {
+        Some(p) => format!("({}, {})", p.x, p.y),
+        None => "off-image".to_string(),
+    }
+}
 
 /// Binary-search a `PixelRow` slice sorted by `(y, x)` for the row at
 /// `xy`. Both `pixel_index.lit` and `pixel_index.refs` are built in
@@ -310,12 +321,12 @@ fn build_selection_data(
                 if backref_src.is_none() {
                     backref_src = src_xy;
                 }
-                let from = src_xy.map(|p| (p.x, p.y));
                 let alts =
                     valid_dist_alts(block, r.dist_sym, r.out_pos, r.src_out_pos, &c.dist_encs);
                 info_lines.push(format!(
-                    "  {ch_name}: BACKREF  val={}  block={block}  from={from:?}  dist={dist}  len={}  {} redirect options",
+                    "  {ch_name}: BACKREF  val={}  block={block}  from={}  dist={dist}  len={}  {} redirect options",
                     c.output.get(base_raw + ch).copied().unwrap_or(0),
+                    fmt_pixel(src_xy),
                     r.copy_len,
                     alts.len(),
                 ));
@@ -352,47 +363,54 @@ fn build_ref_redirect_edits(
                  src_out_pos: new_src,
                  distance: new_dist,
              }| {
-            let SymCode {
-                code: new_code,
-                len: new_len,
-            } = de.get(new_dsym as u16).unwrap_or_default();
-            if new_len != old_len {
-                return None;
-            }
-            let src_xy2 = c.raster.out_to_xy(OutPos(new_src)).map(|xy| (xy.x, xy.y));
-            let new_src_us = new_src as usize;
-            // One representative byte per channel: the high byte at
-            // 16-bit (which is what `to_rgba8` displays), the whole byte
-            // at 8-bit. Sampling `0..bpp` raw would splice a 16-bit R's
-            // low byte in as "G".
-            let bytes_per_sample = (c.info.bit_depth.max(8) / 8) as usize;
-            let preview: Vec<u8> = (0..c.info.color_type.channels() as usize)
-                .filter_map(|chan| c.output.get(new_src_us + chan * bytes_per_sample).copied())
-                .collect();
-            let label = format!(
-                "[{ch_name}] REDIRECT  dist {dist} → {new_dist}  src {src_xy2:?}  val≈{preview:?}"
-            );
-            let bg = preview_color(&preview);
-            Some(EditOption {
-                label,
-                bg_color: bg,
-                fg_color: contrast_text_color(bg),
-                action: EditAction {
-                    patches: vec![Patch {
-                        bit_start: r.dist_bit_start,
-                        value: new_code as u32,
-                        code_len: new_len,
-                    }],
-                    label: format!("redirect dist_sym → {new_dsym}"),
-                    kind: EditKind::DistRedirect {
-                        out_pos: r.out_pos,
-                        copy_len: r.copy_len,
-                        src_after: new_src,
-                        dist_sym_after: new_dsym,
+                let SymCode {
+                    code: new_code,
+                    len: new_len,
+                } = de.get(new_dsym as u16).unwrap_or_default();
+                if new_len != old_len {
+                    return None;
+                }
+                let src_xy2 = c.raster.out_to_xy(OutPos(new_src));
+                let new_src_us = new_src as usize;
+                // One representative byte per channel: the high byte at
+                // 16-bit (which is what `to_rgba8` displays), the whole byte
+                // at 8-bit. Sampling `0..bpp` raw would splice a 16-bit R's
+                // low byte in as "G".
+                let bytes_per_sample = (c.info.bit_depth.max(8) / 8) as usize;
+                let preview: Vec<u8> = (0..c.info.color_type.channels() as usize)
+                    .filter_map(|chan| c.output.get(new_src_us + chan * bytes_per_sample).copied())
+                    .collect();
+                let preview_txt = preview
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let label = format!(
+                    "[{ch_name}] REDIRECT  dist {dist} → {new_dist}  src {}  val≈{preview_txt}",
+                    fmt_pixel(src_xy2)
+                );
+                let bg = preview_color(&preview);
+                Some(EditOption {
+                    label,
+                    bg_color: bg,
+                    fg_color: contrast_text_color(bg),
+                    action: EditAction {
+                        patches: vec![Patch {
+                            bit_start: r.dist_bit_start,
+                            value: new_code as u32,
+                            code_len: new_len,
+                        }],
+                        label: format!("redirect distance {dist} → {new_dist}"),
+                        kind: EditKind::DistRedirect {
+                            out_pos: r.out_pos,
+                            copy_len: r.copy_len,
+                            src_after: new_src,
+                            dist_sym_after: new_dsym,
+                        },
                     },
-                },
-            })
-        })
+                })
+            },
+        )
         .collect()
 }
 
@@ -429,7 +447,6 @@ fn build_lit_swap_edits(
     let mut out = Vec::new();
     for ((val, blk), sites) in lit_groups {
         let le = &c.lit_encs[*blk as usize];
-        let clen = le.get(*val as u16).map_or(0, |c| c.len);
         let mut swappable: Vec<u16> = same_len_lit_swaps(le, *val as u16).collect();
         swappable.sort();
         let chs: String = sites
@@ -442,7 +459,7 @@ fn build_lit_swap_edits(
                 code: new_code,
                 len: new_len,
             } = le.get(tgt).unwrap_or_default();
-            let label = format!("[{chs}] LITERAL  {val} → {tgt}  (both {clen}-bit)");
+            let label = format!("[{chs}] LITERAL  {val} → {tgt}");
             let bg = Color32::from_gray(tgt as u8);
             let fg = Color32::from_gray(255u8.saturating_sub(tgt as u8));
             let patches: Vec<Patch> = sites

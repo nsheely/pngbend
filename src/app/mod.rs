@@ -70,6 +70,10 @@ pub(in crate::app) struct ViewState {
     pub(in crate::app) texture: Option<egui::TextureHandle>,
     pub(in crate::app) texture_dirty: bool,
     pub(in crate::app) overlay_mode: OverlayMode,
+    /// Set once the user picks any entry in the overlay selector. Until
+    /// then the first pixel click auto-shows the cascade overlay; after,
+    /// the chosen mode (including an explicit `None`) is left alone.
+    pub(in crate::app) overlay_user_set: bool,
     pub(in crate::app) overlay_cache: OverlayCache,
     pub(in crate::app) cascade_rgba: Option<Vec<u8>>,
     pub(in crate::app) cascade_scratch: CascadeScratch,
@@ -184,7 +188,7 @@ impl PngBendApp {
                 info_text: "Click a pixel to inspect it.".to_string(),
                 ..Default::default()
             },
-            status: "Drop a PNG or use File → Open.".to_string(),
+            status: "Drop a PNG here, or press Ctrl+O to open one.".to_string(),
             ..Self::default()
         };
         if let Some(p) = path {

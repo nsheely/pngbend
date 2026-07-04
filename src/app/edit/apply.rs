@@ -7,7 +7,7 @@ use crate::index::{build_reverse_graph, event_at};
 use crate::png::ChunkType;
 
 use super::super::PngBendApp;
-use super::super::select::SelectSource;
+use super::super::select::{SelectSource, fmt_pixel};
 use super::render::{apply_patches_capturing_prior, render_affected_rows};
 use super::{ByteWrite, EditAction, EditKind};
 
@@ -20,7 +20,11 @@ impl PngBendApp {
             return;
         };
         self.sel.selected_edit = None;
-        self.status = format!("Applied: {}  at {:?}", action.label, self.sel.sel_pixel);
+        self.status = format!(
+            "Applied: {}  at {}",
+            action.label,
+            fmt_pixel(self.sel.sel_pixel)
+        );
         let inverse = self.apply_and_capture_inverse(action);
         self.doc.history.record(inverse);
         self.doc.dirty = true;
