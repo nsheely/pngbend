@@ -1,0 +1,55 @@
+# cargo-deny configuration: supply-chain gate run in CI.
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# Vulnerability and yanked advisories fail the check for any crate in the tree.
+yanked = "deny"
+# Unmaintained advisories are scoped to workspace members + their direct
+# dependencies. Transitive unmaintained crates deep in the GUI stack (e.g.
+# ttf-parser via egui/winit) have no safe upgrade and aren't actionable here;
+# a direct dependency going unmaintained still fails.
+unmaintained = "workspace"
+ignore = [
+    # quick-xml DoS advisories reachable only through the Linux Wayland backend
+    # (wayland-scanner / smithay-client-toolkit), pinned to v0.39.4 by those
+    # crates until they bump upstream. Not reachable from pngbend's attack
+    # surface: untrusted input is PNG data handled by the zero-dependency
+    # glasspng codec; quick-xml here parses trusted, build-time Wayland protocol
+    # XML. Remove when the Wayland stack updates past the affected range.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+version = 2
+# Permissive licenses actually present in the dependency tree. Anything not
+# listed fails the check, so a new copyleft dependency is caught. The font and
+# Unicode licenses appear in `AND` expressions (egui's default fonts,
+# unicode-ident) so both halves must be allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of a crate are a warning, not a hard failure.
+multiple-versions = "warn"
+
+[sources]
+# Dependencies must come from crates.io; unknown registries/git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"
