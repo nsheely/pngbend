@@ -54,6 +54,28 @@ impl ReverseGraph {
 }
 
 pub fn build_reverse_graph(events: &[Event], output_len: usize) -> ReverseGraph {
+    // Soundness gate for the unchecked writes below, and for the unchecked
+    // reads its output feeds (`super::Cascade` indexes `depth_map` by edge
+    // value). Both the source range `[src_out_pos, src_out_pos + copy_len)`
+    // (the write index here) and the destination range `[out_pos, out_pos +
+    // copy_len)` (the edge values, which the cascade uses as indices) must lie
+    // within `output_len`. The decoder guarantees this, but `RefEvent`'s
+    // fields are public, so a caller could construct an out-of-range ref from
+    // safe code. Verify once (one sequential pass, cheap next to the two build
+    // passes) and return an empty graph on violation rather than let an
+    // unchecked access run out of bounds.
+    let in_bounds = events.iter().all(|e| match e {
+        Event::Ref(r) => {
+            let len = r.copy_len as usize;
+            (r.src_out_pos as usize).saturating_add(len) <= output_len
+                && (r.out_pos as usize).saturating_add(len) <= output_len
+        }
+        Event::Lit(_) => true,
+    });
+    if !in_bounds {
+        return ReverseGraph::default();
+    }
+
     // Pass 1: count out-degree of every source position via range update.
     //
     // For a ref with `src_out_pos = s, copy_len = L`, every cell in
@@ -62,9 +84,8 @@ pub fn build_reverse_graph(events: &[Event], output_len: usize) -> ReverseGraph 
     // same degrees with `O(events)` scattered writes instead of
     // `O(Σ copy_len)`.
     //
-    // The decoder guarantees `s + L ≤ output_len` for every ref (the source
-    // is already in `output` when the ref is emitted), so both writes are in
-    // bounds against `delta` of length `output_len + 1`. The unchecked
+    // The gate above guarantees `s + L ≤ output_len` for every ref, so both
+    // writes land inside `delta` (length `output_len + 1`). The unchecked
     // writes skip `Vec::index_mut`'s precondition chain, a noticeable
     // fraction of build time on multi-million-event inputs per `perf`.
     let mut delta: Vec<i32> = vec![0; output_len + 1];
@@ -186,6 +207,20 @@ mod tests {
         n1.sort();
         assert_eq!(n0, vec![2, 4]);
         assert_eq!(n1, vec![3, 5]);
+    }
+
+    #[test]
+    fn out_of_range_ref_yields_empty_graph_without_ub() {
+        // `RefEvent`'s fields are public, so safe code can build a ref whose
+        // source range runs past `output_len`. This must not index out of
+        // bounds (would be UB in release with the unchecked writes); the gate
+        // returns an empty graph instead.
+        let hostile = vec![refe(0, 10_000, 100)];
+        let g = build_reverse_graph(&hostile, 4);
+        assert!(g.is_empty());
+        // A ref ending exactly at `output_len` is still valid and builds.
+        let ok = vec![lit(0), lit(1), refe(2, 0, 2)];
+        assert_eq!(build_reverse_graph(&ok, 4).neighbors(0), &[2]);
     }
 
     #[test]

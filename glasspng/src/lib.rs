@@ -1,9 +1,10 @@
 //! Glass-box PNG codec.
 //!
-//! Decodes and encodes every colour type, bit depth, and Adam7 interlacing
-//! the format defines, and additionally exposes the DEFLATE *event stream*
-//! (every literal and LZ77 back-reference with its bit offset) plus the
-//! per-block Huffman tables, so a consumer can edit the compressed
+//! Decodes every colour type, bit depth, and Adam7 interlacing the format
+//! defines. Encodes the byte-aligned non-indexed colour types (grey,
+//! grey+alpha, RGB, RGBA at 8 or 16-bit). Additionally exposes the DEFLATE
+//! *event stream* (every literal and LZ77 back-reference with its bit offset)
+//! plus the per-block Huffman tables, so a consumer can edit the compressed
 //! representation and re-emit a valid PNG without recompressing. The
 //! [`pngbend`](https://github.com/nsheely/pngbend) editor is the reference
 //! consumer of that introspection surface.

@@ -57,13 +57,25 @@ fn event_out_pos(e: &Event) -> u32 {
 /// and consumed by [`super::build_pixel_index`]; not kept at runtime.
 pub fn build_pos_to_ev(events: &[Event], output_len: usize) -> Vec<u32> {
     let mut pos_to_ev = vec![POS_UNSET; output_len];
+    // Soundness gate for the unchecked writes below (same rationale as
+    // [`super::build_reverse_graph`]). Every write must land within
+    // `output_len`; the decoder guarantees it, but `Event`'s fields are
+    // public, so a caller could pass an out-of-range event from safe code.
+    // On violation return the unwritten map rather than risk an out-of-bounds
+    // write. One sequential pass, cheap next to the fill below.
+    let in_bounds = events.iter().all(|e| match e {
+        Event::Lit(l) => (l.out_pos as usize) < output_len,
+        Event::Ref(r) => (r.out_pos as usize).saturating_add(r.copy_len as usize) <= output_len,
+    });
+    if !in_bounds {
+        return pos_to_ev;
+    }
     for (i, e) in events.iter().enumerate() {
         match e {
             Event::Lit(lit) => {
                 let out_pos = lit.out_pos as usize;
-                debug_assert!(out_pos < output_len, "lit out_pos out of range");
                 debug_assert_eq!(pos_to_ev[out_pos], POS_UNSET, "events must not overlap");
-                // SAFETY: bound checked by the debug_assert above.
+                // SAFETY: the gate above proved `out_pos < output_len`.
                 unsafe {
                     *pos_to_ev.get_unchecked_mut(out_pos) = i as u32;
                 }
@@ -71,8 +83,7 @@ pub fn build_pos_to_ev(events: &[Event], output_len: usize) -> Vec<u32> {
             Event::Ref(r) => {
                 let start = r.out_pos as usize;
                 let end = start + r.copy_len as usize;
-                debug_assert!(end <= output_len, "ref copy extends past output");
-                // SAFETY: `end ≤ output_len = pos_to_ev.len()`.
+                // SAFETY: the gate above proved `end ≤ output_len = len`.
                 let span = unsafe { pos_to_ev.get_unchecked_mut(start..end) };
                 span.fill(i as u32);
             }
@@ -113,6 +124,16 @@ mod tests {
         for (pos, &expected) in dense.iter().enumerate() {
             assert_eq!(event_at(&events, pos), Some(expected));
         }
+    }
+
+    #[test]
+    fn out_of_range_event_yields_unwritten_map_without_ub() {
+        // Event positions are public, so safe code can build an event that
+        // writes past output_len. The gate must return the all-unset map
+        // rather than index out of bounds (UB in release with the unchecked
+        // writes).
+        assert_eq!(build_pos_to_ev(&[lit(10_000)], 4), vec![POS_UNSET; 4]);
+        assert_eq!(build_pos_to_ev(&[refe(2, 100)], 4), vec![POS_UNSET; 4]);
     }
 
     #[test]

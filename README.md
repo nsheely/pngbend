@@ -23,7 +23,7 @@ UCNV's [*The Art of PNG Glitch*](https://ucnv.github.io/pnglitch/) covers PNG gl
 ## Recent Changes
 
 - **The codec is now its own crate, [`glasspng`](glasspng/).** A zero-dependency PNG codec, split out of the editor. Decode to pixels, or read the DEFLATE literal/back-reference event stream and per-block Huffman tables behind each pixel, edit them, and re-emit a valid PNG. `pngbend` drives it.
-- **glasspng decodes and encodes every PNG:** all colour types, bit depths, and Adam7 interlacing, with a DEFLATE compressor (greedy LZ77 plus stored / fixed / dynamic Huffman). A differential test checks it against the reference `png` crate over the PngSuite corpus.
+- **glasspng decodes every PNG; the encoder covers most.** Decode handles all colour types, bit depths, and Adam7 interlacing, checked against the reference `png` crate across the PngSuite corpus. Encode writes the byte-aligned non-indexed types (grey, grey+alpha, RGB, RGBA, 8 or 16-bit) with a DEFLATE compressor: greedy LZ77 plus stored / fixed / dynamic Huffman.
 
 ## Current Goals
 

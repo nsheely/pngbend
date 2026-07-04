@@ -10,8 +10,8 @@ Huffman tables) so you can edit the compressed representation and re-emit a
 valid PNG *without recompressing*. That's what makes bit-level databending and
 lossless surgical edits possible on data a normal decode discards.
 
-It decodes and encodes every colour type, bit depth, and Adam7 interlacing
-the format defines. Zero dependencies, `std` only.
+It decodes every colour type, bit depth, and Adam7 interlacing the format
+defines. Zero dependencies, `std` only.
 
 ```rust
 let img = glasspng::decode(&bytes)?;              // standard: bytes -> RGBA8
@@ -23,9 +23,10 @@ Edit `gb.deflate.output`, then `gb.deflate.to_deflate()` (or `png::build_zlib_st
 + `png::write_chunks`) to save. The `bitstream` / `deflate` / `png` / `coords`
 modules are public for stage-by-stage use.
 
-The from-scratch encoder currently emits uncompressed DEFLATE (valid, but
-larger than a compressing encoder); LZ77 + dynamic-Huffman compression is a
-planned add.
+The encoder writes the byte-aligned non-indexed colour types (grey,
+grey+alpha, RGB, RGBA, 8 or 16-bit), compressing with greedy LZ77 and the
+smallest of stored, fixed-Huffman, and dynamic-Huffman blocks. Indexed,
+sub-byte, and interlaced output aren't emitted yet.
 
 ## License
 

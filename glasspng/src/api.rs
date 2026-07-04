@@ -270,9 +270,10 @@ pub struct EncodeOptions {
 }
 
 /// Encode an [`Image`]'s RGBA8 pixels to PNG bytes: `pack` -> `filter` ->
-/// DEFLATE -> zlib -> chunks, the mirror of [`decode`]. The output colour
-/// type / depth come from `options` (default RGBA8). Targets [`pack`] can't
-/// produce from RGBA8 (indexed, sub-byte) return [`PngError::Convert`].
+/// DEFLATE -> zlib -> chunks, the mirror of [`decode`]. The output format
+/// comes from `options` (default RGBA8); [`OutputFormat`] names only the
+/// formats the encoder can produce (the byte-aligned non-indexed colour
+/// types), so an unsupported target isn't representable.
 ///
 /// The DEFLATE stream is compressed with greedy LZ77, emitted as whichever
 /// of stored / fixed-Huffman / dynamic-Huffman is smallest (see [`compress`]).
