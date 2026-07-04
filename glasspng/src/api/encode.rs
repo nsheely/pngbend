@@ -2,43 +2,11 @@
 
 use crate::deflate::compress;
 use crate::png::{
-    Chunk, ChunkType, ColorType, FilterStrategy, PngInfo, ZLIB_DEFAULT_HEADER, build_zlib_stream,
-    filter, pack, write_chunks,
+    Chunk, ChunkType, FilterStrategy, OutputFormat, PngInfo, ZLIB_DEFAULT_HEADER,
+    build_zlib_stream, filter, pack, write_chunks,
 };
 
 use super::{Image, PngError};
-
-/// The pixel formats [`encode`] can produce from RGBA8 input: the byte-aligned
-/// non-indexed colour types. Indexed and sub-byte outputs, which `pack` can't
-/// build, are not representable here rather than rejected at runtime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutputFormat {
-    #[default]
-    Rgba8,
-    Rgb8,
-    Grey8,
-    GreyAlpha8,
-    Rgba16,
-    Rgb16,
-    Grey16,
-    GreyAlpha16,
-}
-
-impl OutputFormat {
-    /// The `(colour type, bit depth)` this format writes to IHDR and packs to.
-    fn dims(self) -> (ColorType, u8) {
-        match self {
-            Self::Rgba8 => (ColorType::Rgba, 8),
-            Self::Rgb8 => (ColorType::Rgb, 8),
-            Self::Grey8 => (ColorType::Greyscale, 8),
-            Self::GreyAlpha8 => (ColorType::GreyAlpha, 8),
-            Self::Rgba16 => (ColorType::Rgba, 16),
-            Self::Rgb16 => (ColorType::Rgb, 16),
-            Self::Grey16 => (ColorType::Greyscale, 16),
-            Self::GreyAlpha16 => (ColorType::GreyAlpha, 16),
-        }
-    }
-}
 
 /// Output format and filtering for [`encode`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -95,7 +63,7 @@ fn ihdr_bytes(info: &PngInfo) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::png::FilterType;
+    use crate::png::{ColorType, FilterType};
     use crate::{Image, decode};
 
     #[test]

@@ -378,6 +378,40 @@ pub fn apply_color_key(rgba: &mut [u8], info: &PngInfo, key: TrnsKey) {
     }
 }
 
+/// The pixel formats [`pack`] can produce from RGBA8 input: exactly the
+/// `(colour type, bit depth)` pairs `pack` handles. Indexed and sub-byte
+/// outputs, which `pack` can't build, are not representable here rather than
+/// rejected at runtime. Lives beside `pack` so the two can't drift;
+/// [`crate::EncodeOptions`] selects one for [`crate::encode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    #[default]
+    Rgba8,
+    Rgb8,
+    Grey8,
+    GreyAlpha8,
+    Rgba16,
+    Rgb16,
+    Grey16,
+    GreyAlpha16,
+}
+
+impl OutputFormat {
+    /// The `(colour type, bit depth)` this format writes to IHDR and packs to.
+    pub(crate) fn dims(self) -> (ColorType, u8) {
+        match self {
+            Self::Rgba8 => (ColorType::Rgba, 8),
+            Self::Rgb8 => (ColorType::Rgb, 8),
+            Self::Grey8 => (ColorType::Greyscale, 8),
+            Self::GreyAlpha8 => (ColorType::GreyAlpha, 8),
+            Self::Rgba16 => (ColorType::Rgba, 16),
+            Self::Rgb16 => (ColorType::Rgb, 16),
+            Self::Grey16 => (ColorType::Greyscale, 16),
+            Self::GreyAlpha16 => (ColorType::GreyAlpha, 16),
+        }
+    }
+}
+
 /// Pack RGBA8 pixels back into the raw (unfiltered) byte layout for
 /// `info`'s colour type, the inverse of [`to_rgba8`]. Supports the byte-
 /// aligned non-indexed types (Grey/RGB/GreyAlpha/RGBA at 8 and 16 bit);

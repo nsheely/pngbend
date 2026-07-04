@@ -12,8 +12,8 @@ pub use chunks::{
     parse_ihdr, read_chunks, write_chunks,
 };
 pub use convert::{
-    ConvertError, PaletteEntry, TrnsKey, apply_color_key, decode_palette, pack, to_rgba8,
-    to_rgba8_rows_into,
+    ConvertError, OutputFormat, PaletteEntry, TrnsKey, apply_color_key, decode_palette, pack,
+    to_rgba8, to_rgba8_rows_into,
 };
 pub use filter::{FilterError, FilterStrategy, FilterType, filter, unfilter, unfilter_rows_into};
 pub use interlace::{

@@ -45,10 +45,9 @@
 mod api;
 
 pub use api::{
-    EncodeOptions, GlassBox, Image, OutputFormat, PngError, decode, decode_strict,
-    decode_with_events, encode,
+    EncodeOptions, GlassBox, Image, PngError, decode, decode_strict, decode_with_events, encode,
 };
-pub use png::Warning;
+pub use png::{FilterStrategy, OutputFormat, Warning};
 
 pub mod bitstream;
 pub mod coords;
