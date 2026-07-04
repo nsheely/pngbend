@@ -15,3 +15,8 @@
 perf.data*
 flamegraph.svg
 *.json.gz
+
+# PngSuite conformance corpus: not vendored. Fetched by
+# scripts/fetch-pngsuite.sh (CI runs it before tests); the pngsuite
+# differential test skips cleanly when the corpus is absent.
+/glasspng/tests/pngsuite/

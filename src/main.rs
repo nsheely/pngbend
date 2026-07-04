@@ -6,21 +6,22 @@ use std::sync::Arc;
 use pngbend::app::PngBendApp;
 use pngbend::deflate::decode_deflate;
 use pngbend::png::{
-    concat_idat, decode_palette, parse_ihdr, parse_zlib_stream, read_chunks, to_rgba8, unfilter,
+    ChunkType, concat_idat, decode_palette, parse_ihdr, parse_zlib_stream, read_chunks, to_rgba8,
+    unfilter,
 };
 
 /// Decode the embedded app-icon PNG through pngbend's own pipeline.
-/// The icon is shipped with the binary so every `expect` here is a
-/// build-time guarantee: a broken `assets/icon.png` would fail CI.
+/// The icon ships with the binary, so every `expect` is a build-time
+/// guarantee: a broken `assets/icon.png` fails CI.
 fn load_icon() -> egui::IconData {
     let bytes = include_bytes!("../assets/icon.png");
-    let parsed = read_chunks(bytes).expect("icon chunks");
-    let info = parse_ihdr(&parsed).expect("icon IHDR");
-    let palette = parsed
+    let chunks = read_chunks(bytes).expect("icon chunks").chunks;
+    let info = parse_ihdr(&chunks).expect("icon IHDR");
+    let palette = chunks
         .iter()
-        .find(|c| &c.typ == b"PLTE")
+        .find(|c| c.typ == ChunkType::PLTE)
         .map(|p| decode_palette(&p.data, None));
-    let idat = concat_idat(&parsed);
+    let idat = concat_idat(&chunks);
     let zlib = parse_zlib_stream(&idat).expect("icon zlib header");
     let decoded = decode_deflate(zlib.deflate_buf, None).expect("icon deflate");
     let unfiltered = unfilter(&decoded.output, &info).expect("icon unfilter");

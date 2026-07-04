@@ -1,37 +1,37 @@
 //! Map an output-byte offset to the event that produced it.
 //!
 //! Two flavours:
-//! - [`event_at`] — `O(log N)` binary search over the events list. Right
-//!   for sparse runtime queries (a few per click, a handful per visible
+//! - [`event_at`]: `O(log N)` binary search over the events list, for
+//!   sparse runtime queries (a few per click, a handful per visible
 //!   sidebar row).
-//! - [`build_pos_to_ev`] — dense `Vec<u32>` indexed by byte. Builds in
-//!   `O(events)` and answers in `O(1)`. Right when the same lookup runs
-//!   for every byte, which is what `build_pixel_index` does during load.
+//! - [`build_pos_to_ev`]: dense `Vec<u32>` indexed by byte. Builds in
+//!   `O(events)`, answers in `O(1)`, for when the same lookup runs for
+//!   every byte, as `build_pixel_index` does during load.
 //!
-//! Events are emitted by the decoder in strictly increasing `out_pos`
-//! order and each one's output range (`out_pos..out_pos + len`) abuts the
-//! next event's start, so a binary search by `out_pos` plus a range check
-//! resolves any byte to its single owning event.
+//! The decoder emits events in strictly increasing `out_pos` order and
+//! each output range (`out_pos..out_pos + len`) abuts the next event's
+//! start, so a binary search by `out_pos` plus a range check resolves any
+//! byte to its single owning event.
 
 use crate::deflate::Event;
 
-/// Sentinel in the dense [`build_pos_to_ev`] map meaning "no event wrote
-/// this output position". A well-formed stream claims every byte with
-/// exactly one event, so the sentinel only ever surfaces on truncated
-/// or malformed input.
+/// Sentinel in the dense [`build_pos_to_ev`] map: "no event wrote this
+/// output position". A well-formed stream claims every byte with exactly
+/// one event, so the sentinel only surfaces on truncated or malformed
+/// input.
 const POS_UNSET: u32 = u32::MAX;
 
 /// Index of the event that produced output byte `pos`, or `None` if no
 /// event covers it (e.g. truncated input). `O(log events.len())`.
 ///
-/// `events` must be sorted by `out_pos` — the decoder emits them that way.
+/// `events` must be sorted by `out_pos`; the decoder emits them that way.
 pub fn event_at(events: &[Event], pos: usize) -> Option<u32> {
     if events.is_empty() {
         return None;
     }
     let pos_u32 = u32::try_from(pos).ok()?;
     // partition_point gives the smallest index whose `out_pos > pos`. The
-    // event we want is the one immediately before that — if any.
+    // event we want is the one immediately before that, if any.
     let next = events.partition_point(|e| event_out_pos(e) <= pos_u32);
     let i = next.checked_sub(1)?;
     // SAFETY/RANGE: i < events.len() because next > 0 here.
@@ -53,9 +53,8 @@ fn event_out_pos(e: &Event) -> u32 {
 }
 
 /// Dense byte → event-index map. `out[i]` is the event that wrote byte
-/// `i`, or [`POS_UNSET`] for unwritten positions. Built once during load
-/// and consumed by [`super::build_pixel_index`]; the GUI doesn't keep
-/// this around at runtime.
+/// `i`, or `POS_UNSET` for unwritten positions. Built once during load
+/// and consumed by [`super::build_pixel_index`]; not kept at runtime.
 pub fn build_pos_to_ev(events: &[Event], output_len: usize) -> Vec<u32> {
     let mut pos_to_ev = vec![POS_UNSET; output_len];
     for (i, e) in events.iter().enumerate() {
@@ -92,7 +91,6 @@ mod tests {
             out_pos,
             symbol: 0,
             bit_start: 0,
-            block: 0,
         })
     }
 
@@ -102,7 +100,6 @@ mod tests {
             src_out_pos: 0,
             copy_len,
             dist_sym: 0,
-            block: 0,
             dist_bit_start: 0,
         })
     }

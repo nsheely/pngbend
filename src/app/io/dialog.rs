@@ -28,7 +28,7 @@ impl PngBendApp {
             self.status = "Save failed: no file loaded".to_string();
             return;
         };
-        let zlib = png::build_zlib_stream(&self.doc.deflate_buf, &self.doc.zlib_header, &c.output);
+        let zlib = png::build_zlib_stream(&self.doc.deflate_buf, self.doc.zlib_header, &c.output);
         let png_bytes = self.assemble_png_bytes(&zlib);
         let default_name = self
             .doc
@@ -47,7 +47,7 @@ impl PngBendApp {
                 .add_filter("PNG", &["png"])
                 .save_file()
             else {
-                return; // cancelled — tx drops, rx disconnects
+                return; // cancelled: tx drops, rx disconnects
             };
             let result = match std::fs::write(&dest, &png_bytes) {
                 Ok(()) => DialogResult::SaveDone(dest),
@@ -73,7 +73,7 @@ impl PngBendApp {
                 let _ = tx.send(DialogResult::Open(p));
                 ctx.request_repaint();
             }
-            // cancelled — tx drops, rx disconnects
+            // cancelled: tx drops, rx disconnects
         });
     }
 

@@ -8,24 +8,21 @@
 /// Streaming reader over a deflate bit stream.
 ///
 /// Positions are bit offsets from the start. Reads past the end yield
-/// zero bytes — corrupt or truncated input must be detected by whichever
+/// zero bytes; corrupt or truncated input must be detected by whichever
 /// decoder consumes the bits, not by this reader.
 pub struct BitReader {
     data: Vec<u8>,
     pos: usize,
 }
 
-/// Trailing-zero padding so unaligned `u32` reads at any byte position
-/// up to `data.len()` stay in bounds. We pad generously so a malformed
-/// deflate stream that over-reads past the end still returns zeros
-/// rather than panicking until the calling decoder notices something
-/// is wrong (typically when an unexpected Huffman code surfaces).
+/// Trailing zero padding so an unaligned `u32` read at any byte position
+/// up to `data.len()` stays in bounds. An over-read past the end returns
+/// zeros instead of panicking; the consuming decoder surfaces the
+/// truncation itself.
 const PEEK_PAD: usize = 8;
 
 impl BitReader {
-    /// Wrap `data` for reading. Reads past the actual stream end yield
-    /// zero bytes — corrupt or truncated input must be detected by
-    /// whichever decoder consumes the bits, not by this reader.
+    /// Wrap `data` for reading.
     pub fn new(data: &[u8]) -> Self {
         let mut padded = Vec::with_capacity(data.len() + PEEK_PAD);
         padded.extend_from_slice(data);
@@ -36,11 +33,8 @@ impl BitReader {
         }
     }
 
-    /// Read up to 32 bits, LSB-first within bytes. Returns zero for any
-    /// bit position that would over-read past the padded buffer — a
-    /// signal to the calling decoder that the stream is truncated /
-    /// malformed (it'll subsequently fail on an invalid Huffman code or
-    /// similar).
+    /// Read up to 32 bits, LSB-first within bytes. Over-reads past the
+    /// padded buffer return zero.
     #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> u32 {
         if n == 0 {
@@ -57,20 +51,17 @@ impl BitReader {
             self.data[byte_idx + 2],
             self.data[byte_idx + 3],
         ]);
-        // `(1u32 << 32) - 1` overflows `u32` (panics in debug, returns 0
-        // in release). Special-case `n == 32` to use the full `u32` mask
-        // — for byte-aligned reads that recovers the full value, which
-        // was previously silently dropped to 0.
+        // `(1u32 << 32) - 1` overflows `u32` (debug panic, release wrap),
+        // so `n == 32` uses the full `u32::MAX` mask.
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         let result = (val >> (self.pos & 7)) & mask;
         self.pos += n as usize;
         result
     }
 
-    /// Peek up to 32 bits without advancing. The Huffman decoder uses this
-    /// to look up a symbol in a LUT keyed by the next `max_bits`, then
-    /// advances by only the matched code length. Returns zero past the
-    /// padded buffer (see [`read_bits`] for the rationale).
+    /// Peek up to 32 bits without advancing: the Huffman decoder looks up
+    /// a symbol in a LUT keyed by the next `max_bits`, then advances by
+    /// only the matched code length. Over-reads return zero.
     #[inline(always)]
     pub fn peek_bits(&self, n: u32) -> u32 {
         if n == 0 {
@@ -109,8 +100,8 @@ impl BitReader {
 }
 
 /// Patch `n` bits of `value` (MSB-first) into `buf` starting at bit position
-/// `bit_start`. Sets *and* clears bits — safe to call repeatedly on the same
-/// byte without leaking previous values.
+/// `bit_start`. Sets *and* clears bits, so it is safe to call repeatedly on
+/// the same byte without leaking previous values.
 ///
 /// Reads of those bits via [`BitReader`] recover `value`.
 pub fn write_bits(buf: &mut [u8], bit_start: usize, value: u32, n: u8) {
@@ -130,9 +121,9 @@ pub fn write_bits(buf: &mut [u8], bit_start: usize, value: u32, n: u8) {
 }
 
 /// Read up to 32 bits at an arbitrary bit position. The standalone form
-/// (vs. constructing a [`BitReader`]) is for one-shot reads — capturing
-/// the bits about to be overwritten by a [`write_bits`] call so the
-/// reverse patch is recoverable, for example.
+/// (vs. constructing a [`BitReader`]) is for one-shot reads, such as
+/// capturing the bits about to be overwritten by a [`write_bits`] call so
+/// the reverse patch is recoverable.
 pub fn read_bits_at(buf: &[u8], bit_start: usize, n: u8) -> u32 {
     let mut value = 0u32;
     for i in 0..n as usize {
@@ -170,7 +161,7 @@ mod tests {
         let mut reader = BitReader::new(&buf);
         // BitReader yields LSB-first within byte; write_bits stores MSB of value
         // at the lowest bit position. So a 4-bit value 0b1010 packed at bit 0
-        // becomes bits (1, 0, 1, 0) at positions (0, 1, 2, 3) — read_bits(4)
+        // becomes bits (1, 0, 1, 0) at positions (0, 1, 2, 3), so read_bits(4)
         // reconstructs 0b0101 = 5.
         assert_eq!(reader.read_bits(4), 0b0101);
         assert_eq!(reader.read_bits(4), 0b0011);
@@ -199,11 +190,10 @@ mod tests {
         assert_eq!(reader.bit_pos(), 8); // already aligned
     }
 
-    /// Regression: pre-fix `read_bits(32)` computed `(1u32 << 32) - 1`
-    /// which panics in debug and silently returns 0 in release. The
-    /// fix special-cases `n == 32` to use `u32::MAX`. The byte-aligned
-    /// path is exercised here (the only case the previous code could
-    /// have got right with a 32-bit window).
+    /// `read_bits(32)` must use a full `u32::MAX` mask; `(1u32 << 32) - 1`
+    /// would overflow (panic in debug, 0 in release). The byte-aligned
+    /// path is the only case a 32-bit window can represent, so it is the
+    /// one exercised here.
     #[test]
     fn read_bits_32_round_trips_full_u32() {
         // BitReader reads LSB-first within each byte, so a byte-aligned
@@ -217,12 +207,11 @@ mod tests {
         assert_eq!(reader.bit_pos(), 32);
     }
 
-    /// Regression: fuzz discovered a malformed deflate stream that
-    /// over-reads past the buffer end. Earlier code padded with only 3
-    /// trailing zero bytes (one short for an unaligned `u32` read at
-    /// `byte_idx == data.len()`), so the read panicked. New behaviour:
-    /// reads past the padded zone yield zeros, letting the calling
-    /// decoder surface the truncation as a structured error.
+    /// A malformed deflate stream can over-read past the buffer end. The
+    /// `PEEK_PAD` trailing zero bytes cover an unaligned `u32` read at
+    /// `byte_idx == data.len()`, so reads past the padded zone yield
+    /// zeros, letting the calling decoder surface the truncation as a
+    /// structured error instead of panicking.
     #[test]
     fn read_past_end_yields_zero_not_panic() {
         let buf = vec![0xFFu8; 4];

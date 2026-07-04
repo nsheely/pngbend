@@ -1,6 +1,6 @@
-//! Workload driver for profiling. Not part of the app — built under the
-//! `profiling` cargo profile (release + debug symbols) so `perf` and
-//! `flamegraph` see real symbol names on the hot code.
+//! Workload driver for profiling. Built under the `profiling` cargo
+//! profile (release + debug symbols) so `perf` and `flamegraph` see
+//! real symbol names.
 //!
 //! Run:
 //! ```text
@@ -9,12 +9,10 @@
 //!   perf record -g ./target/profiling/profile && perf report --stdio -g
 //! ```
 //!
-//! The workload mirrors a realistic interactive session on a large
-//! image: open the file, click-to-select a pixel (cascade BFS), apply
-//! a literal-swap edit, undo, then repeat. It also exercises the
-//! filter rebuild for a typing sequence and the three event-driven
-//! overlays. Each phase prints its own wall-clock so the output reads
-//! like a flamegraph in text form.
+//! Mirrors an interactive session on a large image: open, select a
+//! pixel (cascade BFS), apply a literal swap, undo, repeat. Also
+//! exercises the filter rebuild over a typing sequence and the three
+//! event-driven overlays. Each phase prints its own wall-clock.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -22,8 +20,7 @@ use std::time::{Duration, Instant};
 
 use pngbend::bitstream::{read_bits_at, write_bits};
 use pngbend::composite::{composite_rgba, composite_rows_into};
-use pngbend::coords::ImgGeom;
-use pngbend::deflate::{EncTable, Event, decode_deflate};
+use pngbend::deflate::{EncTable, Event, block_of, decode_deflate};
 use pngbend::index::{
     CascadeScratch, PixelIndex, PixelRow, build_pixel_index, build_pos_to_ev, build_reverse_graph,
     valid_dist_alts,
@@ -51,9 +48,9 @@ fn main() {
     println!("# bytes:  {}", raw.len());
     println!();
 
-    // ── Phase 1: initial load ─────────────────────────────────────────
+    // Phase 1: initial load
     let t = Instant::now();
-    let chunks = read_chunks(&raw).expect("chunks");
+    let chunks = read_chunks(&raw).expect("chunks").chunks;
     let info = parse_ihdr(&chunks).expect("ihdr");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
@@ -64,7 +61,8 @@ fn main() {
     let phase_decode = t.elapsed();
 
     let t = Instant::now();
-    let geom = ImgGeom::new(info.width, info.height, info.bits_per_pixel());
+    let geom = &info;
+    let raster = pngbend::Raster::new(info);
     let pos_to_ev = build_pos_to_ev(&decoded.events, decoded.output.len());
     let phase_pos = t.elapsed();
 
@@ -79,7 +77,8 @@ fn main() {
         &pos_to_ev,
         &decoded.lit_encs,
         &decoded.dist_encs,
-        &geom,
+        &decoded.block_starts,
+        &raster,
     );
     let phase_pi = t.elapsed();
 
@@ -99,7 +98,7 @@ fn main() {
         + phase_unfilter
         + phase_rgba;
 
-    println!("phase 1 — initial load");
+    println!("phase 1: initial load");
     println!(
         "  {:5} {:6} events, {:6}x{:4}, bpp={}",
         "",
@@ -115,42 +114,46 @@ fn main() {
     println!("  build_pixel_index             {phase_pi:?}");
     println!("  unfilter                      {phase_unfilter:?}");
     println!("  to_rgba8                      {phase_rgba:?}");
-    println!("  ────────────────────────────────────────");
+    println!("  ----------------------------------------");
     println!("  load total                    {total_load:?}");
     println!();
 
-    // ── Phase 2: overlay generation ───────────────────────────────────
+    // Phase 2: overlay generation
     let t = Instant::now();
-    let lit_overlay = make_literal_overlay_bytes(&decoded.events, &geom);
+    let lit_overlay = make_literal_overlay_bytes(&decoded.events, geom);
     let phase_lit_ov = t.elapsed();
 
     let t = Instant::now();
-    let dist_overlay = make_distance_overlay_bytes(&decoded.events, &geom, decoded.max_distance);
+    let dist_overlay = make_distance_overlay_bytes(&decoded.events, geom, decoded.max_distance);
     let phase_dist_ov = t.elapsed();
 
     let t = Instant::now();
-    let blk_overlay = make_block_overlay_bytes(&decoded.events, &geom, decoded.num_blocks);
+    let blk_overlay = make_block_overlay_bytes(
+        &decoded.events,
+        geom,
+        &decoded.block_starts,
+        decoded.num_blocks(),
+    );
     let phase_blk_ov = t.elapsed();
 
-    println!("phase 2 — overlay generation (one per mode switch)");
+    println!("phase 2: overlay generation (one per mode switch)");
     println!("  make_literal_overlay_bytes    {phase_lit_ov:?}");
     println!("  make_distance_overlay_bytes   {phase_dist_ov:?}");
     println!("  make_block_overlay_bytes      {phase_blk_ov:?}");
     println!();
 
-    // ── Phase 3: composite (per texture rebuild) ─────────────────────
+    // Phase 3: composite (per texture rebuild)
     let t = Instant::now();
     let mut composited = Vec::with_capacity(base_rgba.len());
-    // Cheap re-invocation using composite_rgba to match what the app does
-    // on every edit → texture rebuild cycle.
+    // Mirror the app's per-edit texture rebuild via composite_rgba.
     for _ in 0..4 {
         composited = composite_rgba(&base_rgba, &lit_overlay);
     }
     let phase_compose = t.elapsed();
-    println!("phase 3 — composite_rgba × 4    {phase_compose:?}");
+    println!("phase 3: composite_rgba × 4    {phase_compose:?}");
     println!();
 
-    // ── Phase 4: filter rebuild (per keystroke) ──────────────────────
+    // Phase 4: filter rebuild (per keystroke)
     let mut total_filter = Duration::ZERO;
     let mut scratch = String::with_capacity(48);
     let mut last_count = 0;
@@ -161,18 +164,17 @@ fn main() {
         last_count = n;
     }
     println!(
-        "phase 4 — rebuild_filter × {}        {total_filter:?}  (last: {} rows)",
+        "phase 4: rebuild_filter × {}        {total_filter:?}  (last: {} rows)",
         FILTER_KEYSTROKES.len(),
         last_count,
     );
 
-    // ── Phase 4b: same keystroke sequence, with narrowing ─────────────
+    // Phase 4b: same keystroke sequence, with narrowing.
     //
-    // When the new needle extends the previous (the user typed another
-    // char), only re-test rows in the previous filtered view rather than
-    // rescanning all of `pi.lit + pi.refs`. Mirrors
-    // `FilterSpec::is_refinement_of` + the narrowing branch in the real
-    // app's `rebuild_filter`.
+    // When the new needle extends the previous, re-test only rows in the
+    // prior filtered view instead of rescanning `pi.lit + pi.refs`.
+    // Mirrors `FilterSpec::is_refinement_of` + the narrowing branch in
+    // `rebuild_filter`.
     let mut total_narrow = Duration::ZERO;
     let mut prev_needle: Option<String> = None;
     let mut view: Vec<(bool, u32)> = Vec::new(); // (is_lit, index)
@@ -212,7 +214,7 @@ fn main() {
     }
     let last_count_narrow = view.len();
     println!(
-        "phase 4b — rebuild_filter × {} w/narrow {total_narrow:?}  (last: {} rows)",
+        "phase 4b: rebuild_filter × {} w/narrow {total_narrow:?}  (last: {} rows)",
         FILTER_KEYSTROKES.len(),
         last_count_narrow,
     );
@@ -221,17 +223,21 @@ fn main() {
     }
     println!();
 
-    // ── Phase 5: edit → FULL reload baseline ─────────────────────────
+    // Phase 5: edit, FULL reload baseline.
     //
-    // For comparison: re-decode the patched stream and rebuild every
-    // index from scratch on each edit. This is the upper bound on what
-    // an edit could cost without the incremental paths in
-    // `app::edit::apply_*_incremental`.
+    // Re-decode the patched stream and rebuild every index from scratch
+    // per edit. Upper bound on edit cost without the incremental paths
+    // in `app::edit::apply_*_incremental`.
     let mut total_full = Duration::ZERO;
     let mut scratch_cascade = CascadeScratch::default();
-    let swaps = find_literal_swaps(&decoded.events, &decoded.lit_encs, EDIT_ITERATIONS);
+    let swaps = find_literal_swaps(
+        &decoded.events,
+        &decoded.lit_encs,
+        &decoded.block_starts,
+        EDIT_ITERATIONS,
+    );
     println!(
-        "phase 5 — {} FULL-reload edit cycles (baseline, no incremental path)",
+        "phase 5: {} FULL-reload edit cycles (baseline, no incremental path)",
         swaps.len()
     );
     for (i, swap) in swaps.iter().enumerate() {
@@ -253,44 +259,43 @@ fn main() {
             &pos_to_ev,
             &decoded.lit_encs,
             &decoded.dist_encs,
-            &geom,
+            &decoded.block_starts,
+            &raster,
         );
         let unfiltered = unfilter(&decoded.output, &info).expect("unfilter");
         let _rgba = to_rgba8(&unfiltered, &info, None).expect("rgba");
         let _c = scratch_cascade.run(&[swap.out_pos], &reverse_graph);
-        let _fe = compute_filter_expansion(&[swap.out_pos], &decoded.output, &geom);
+        let _fe = compute_filter_expansion(&[swap.out_pos], &decoded.output, geom);
         write_bits(&mut deflate_buf, bit_start, prior_code, swap.code_len);
         total_full += t.elapsed();
         println!("  cycle {i}: {:?}", total_full / (i as u32 + 1));
     }
     println!();
 
-    // ── Phase 5b: edit → INCREMENTAL reload (Batch D literal-swap path) ─
+    // Phase 5b: edit, INCREMENTAL reload (literal-swap path).
     //
-    // Mirrors `app::edit::apply_literal_swap_incremental`: patch output +
-    // BFS through reverse_graph + re-run unfilter+rgba. No decode, no
-    // index rebuild, no reverse-graph reconstruction — the existing
-    // indices are still valid because LZ77 topology is unchanged.
+    // Mirrors `app::edit::apply_literal_swap_incremental`: patch output,
+    // BFS through reverse_graph, re-run unfilter+rgba. No decode, index
+    // rebuild, or reverse-graph reconstruction; existing indices stay
+    // valid because LZ77 topology is unchanged.
     let mut total_incr = Duration::ZERO;
     // Keep `output` mutable across cycles so successive swaps see their
-    // predecessors — realistic for what the app would do.
+    // predecessors, as the app does.
     let mut output_incr = decoded.output.clone();
-    let row_bytes = info.row_stride - 1;
     let h = info.height as usize;
-    let w = info.width as usize;
     let mut unfiltered_cache = unfilter(&output_incr, &info).expect("unfilter");
     let mut base_rgba_cache = to_rgba8(&unfiltered_cache, &info, None).expect("rgba");
-    // Reusable row-touched scratch — `bool`-per-row, h=1600 is 1.6 KB.
+    // Reusable row-touched scratch: `bool`-per-row, h=1600 is 1.6 KB.
     let mut row_touched = vec![false; h];
     let mut composite_scratch = Vec::with_capacity(base_rgba_cache.len());
-    // Pre-build a cascade overlay once. In the app this comes from the
-    // most recent `select_pixel` and is reused across apply/undo because
-    // LZ77 topology is stable for literal swaps.
+    // Pre-build the cascade overlay once. In the app it comes from the
+    // most recent `select_pixel`, reused across apply/undo since LZ77
+    // topology is stable for literal swaps.
     let warm_cascade = scratch_cascade.run(&[swaps[0].out_pos], &reverse_graph);
-    let warm_fe = compute_filter_expansion(warm_cascade.affected, &output_incr, &geom);
-    let cached_cascade_overlay = make_cascade_overlay_bytes(&warm_cascade, &warm_fe, &geom);
+    let warm_fe = compute_filter_expansion(warm_cascade.affected, &output_incr, geom);
+    let cached_cascade_overlay = make_cascade_overlay_bytes(&warm_cascade, &warm_fe, geom);
     println!(
-        "phase 5b — {} INCREMENTAL-reload edit cycles + UI follow-up (row-scoped)",
+        "phase 5b: {} INCREMENTAL-reload edit cycles + UI follow-up (row-scoped)",
         swaps.len()
     );
     for (i, swap) in swaps.iter().enumerate() {
@@ -335,7 +340,7 @@ fn main() {
         }
         let t_propagate = t_stage.elapsed();
 
-        // ── row-scoped unfilter
+        // row-scoped unfilter
         let t_stage = Instant::now();
         let mut rebuilt: Vec<usize> = Vec::new();
         if first_affected != usize::MAX {
@@ -351,7 +356,7 @@ fn main() {
         }
         let t_unfilter = t_stage.elapsed();
 
-        // ── row-scoped rgba
+        // row-scoped rgba
         let t_stage = Instant::now();
         to_rgba8_rows_into(
             &unfiltered_cache,
@@ -363,16 +368,15 @@ fn main() {
         .expect("rgba rows");
         let t_rgba = t_stage.elapsed();
 
-        // The app keeps the cascade overlay from the most recent
-        // select_pixel because a literal swap doesn't move LZ77
-        // topology — no BFS, no filter expansion, no per-edit overlay
-        // alloc on the apply/undo path. We materialise the overlay once
-        // outside the loop and reuse it for the row-scoped composite.
+        // A literal swap doesn't move LZ77 topology, so the app keeps
+        // the cascade overlay from the most recent select_pixel: no BFS,
+        // filter expansion, or per-edit overlay alloc on apply/undo.
+        // Overlay materialised once outside the loop.
 
-        // Row-scoped composite: only the rows we just rewrote need
-        // re-blending. Rest of `composite_scratch` keeps last frame's
-        // composite, which is still correct (base_rgba didn't change
-        // outside `rebuilt`, overlay didn't change at all).
+        // Row-scoped composite: only rewritten rows need re-blending.
+        // The rest of `composite_scratch` keeps last frame's composite,
+        // still correct (base_rgba unchanged outside `rebuilt`, overlay
+        // unchanged).
         let t_stage = Instant::now();
         if composite_scratch.len() != base_rgba_cache.len() {
             composite_scratch.clear();
@@ -390,8 +394,6 @@ fn main() {
         // Revert bit stream + data for the next iteration.
         write_bits(&mut deflate_buf, bit_start, prior_code, swap.code_len);
         output_incr[out_pos] = decoded.output[out_pos];
-        let _ = row_bytes;
-        let _ = w;
 
         let elapsed = t_total.elapsed();
         total_incr += elapsed;
@@ -409,20 +411,19 @@ fn main() {
     );
     println!();
 
-    // ── Phase 5c: redirect baseline (decode + rebuild + row-scoped render) ─
+    // Phase 5c: redirect baseline (decode + rebuild + row-scoped render).
     //
-    // Re-decodes the patched stream and rebuilds every derived index,
-    // diffs old-vs-new output, and only re-unfilters / re-converts the
-    // rows that changed. This is the "decode + full rebuild" floor that
-    // the surgical redirect path in
-    // [`app::edit::apply_dist_redirect_incremental`] avoids. Running
-    // both makes the surgical-vs-baseline ratio explicit in the output.
+    // Re-decodes the patched stream, rebuilds every derived index, diffs
+    // old-vs-new output, and re-unfilters/re-converts only changed rows.
+    // The "decode + full rebuild" floor that the surgical redirect path
+    // [`app::edit::apply_dist_redirect_incremental`] avoids; running both
+    // makes the surgical-vs-baseline ratio explicit.
     let mut total_redir = Duration::ZERO;
     let mut prior_output = decoded.output.clone();
     let mut redir_unfiltered = unfilter(&prior_output, &info).expect("unfilter");
     let mut redir_rgba = to_rgba8(&redir_unfiltered, &info, None).expect("rgba");
     println!(
-        "phase 5c — {} redirect-flavoured edit cycles (full rebuild + row-scoped render)",
+        "phase 5c: {} redirect-flavoured edit cycles (full rebuild + row-scoped render)",
         swaps.len()
     );
     for (i, swap) in swaps.iter().enumerate() {
@@ -444,8 +445,8 @@ fn main() {
         let decoded_after = decode_deflate(&deflate_buf, None).expect("decode after edit");
         let t_decode = t_stage.elapsed();
 
-        // Rebuild the three index structures. These are fundamentally
-        // required when LZ77 topology changes; we measure them.
+        // Rebuild the three index structures, required when LZ77
+        // topology changes.
         let t_stage = Instant::now();
         let pos_to_ev_after = build_pos_to_ev(&decoded_after.events, decoded_after.output.len());
         let t_pte = t_stage.elapsed();
@@ -459,12 +460,13 @@ fn main() {
             &pos_to_ev_after,
             &decoded_after.lit_encs,
             &decoded_after.dist_encs,
-            &geom,
+            &decoded_after.block_starts,
+            &raster,
         );
         let t_pi = t_stage.elapsed();
 
-        // Diff old vs new output, starting from the redirected ref's
-        // out_pos. Literal-swap's `out_pos` is a fine stand-in here.
+        // Diff old vs new output from the redirected ref's out_pos.
+        // Literal-swap's `out_pos` is a fine stand-in.
         let t_stage = Instant::now();
         let diff = {
             let old = &prior_output;
@@ -501,8 +503,8 @@ fn main() {
             let last_row = (last_byte.saturating_sub(1)) / info.row_stride;
             let first_row = first_row.min(h.saturating_sub(1));
             let last_row = last_row.min(h.saturating_sub(1));
-            // Copy new output to a scratch; we're treating `prior_output`
-            // as the previous-frame state.
+            // Copy new output to scratch; `prior_output` is the
+            // previous-frame state.
             prior_output.copy_from_slice(&decoded_after.output);
             let mut redir_row_touched = vec![false; h];
             for touched in redir_row_touched
@@ -550,17 +552,20 @@ fn main() {
     );
     println!();
 
-    // ── Phase 5d: SURGICAL redirect (mirror of `apply_dist_redirect_incremental`) ──
+    // Phase 5d: SURGICAL redirect (mirror of `apply_dist_redirect_incremental`).
     //
-    // Skips `decode_deflate` + `build_pos_to_ev` + `build_pixel_index`
-    // entirely. Patches the bit, recopies the ref's bytes from the new
-    // src, BFS-propagates through the existing reverse_graph, and only
-    // then rebuilds reverse_graph (one ref's edges moved from old src to
-    // new src — CSR can't be cheaply mutated in place). max_distance is
-    // refreshed by an O(events) scan. Render stays row-scoped via the
-    // RowTracker that propagation touched.
-    let redirect_targets: Vec<RedirectSwap> =
-        find_redirect_swaps(&decoded.events, &decoded.dist_encs, EDIT_ITERATIONS);
+    // Skips `decode_deflate` + `build_pos_to_ev` + `build_pixel_index`.
+    // Patches the bit, recopies the ref's bytes from the new src,
+    // BFS-propagates through the existing reverse_graph, then rebuilds
+    // reverse_graph (one ref's edges moved; CSR can't be mutated in
+    // place). max_distance refreshed by an O(events) scan. Render stays
+    // row-scoped via the rows propagation touched.
+    let redirect_targets: Vec<RedirectSwap> = find_redirect_swaps(
+        &decoded.events,
+        &decoded.dist_encs,
+        &decoded.block_starts,
+        EDIT_ITERATIONS,
+    );
     let mut total_surgical_redir = Duration::ZERO;
     let mut surg_output = decoded.output.clone();
     let mut surg_events = decoded.events.clone();
@@ -568,7 +573,7 @@ fn main() {
     let mut surg_unfiltered = unfilter(&surg_output, &info).expect("surg unfilter init");
     let mut surg_rgba = to_rgba8(&surg_unfiltered, &info, None).expect("surg rgba init");
     println!(
-        "phase 5d — {} SURGICAL redirect cycles (no decode, no pos_to_ev/pixel_index rebuild)",
+        "phase 5d: {} SURGICAL redirect cycles (no decode, no pos_to_ev/pixel_index rebuild)",
         redirect_targets.len()
     );
     for (i, target) in redirect_targets.iter().enumerate() {
@@ -629,18 +634,16 @@ fn main() {
         }
         let t_propagate = t_stage.elapsed();
 
-        // Rebuild reverse_graph (one ref's outgoing edges moved). CSR
-        // doesn't support cheap edge-set mutation, so we rebuild — but
-        // this is the only structural index that needs it. The benchmark
-        // discards the result because the per-iteration teardown below
-        // rebuilds again from the un-edited `surg_events`; we only need
-        // the wall-clock measurement here.
+        // Rebuild reverse_graph (one ref's outgoing edges moved; CSR has
+        // no cheap edge-set mutation). Only structural index that needs
+        // it. Result discarded: the teardown below rebuilds from the
+        // un-edited `surg_events`; we only want the wall-clock here.
         let t_stage = Instant::now();
         let _new_rev = build_reverse_graph(&surg_events, surg_output.len());
         std::hint::black_box(&_new_rev);
         let t_rev = t_stage.elapsed();
 
-        // Refresh `max_distance` with an O(events) max — cheap.
+        // Refresh `max_distance` with a cheap O(events) max.
         let t_stage = Instant::now();
         let _max_d: u32 = surg_events
             .iter()
@@ -676,9 +679,9 @@ fn main() {
         }
         let t_render = t_stage.elapsed();
 
-        // Stop the per-cycle timer BEFORE the test-only undo work — that
-        // undo isn't part of `apply_dist_redirect_incremental` and would
-        // unfairly inflate the per-edit number we report.
+        // Stop the per-cycle timer BEFORE the test-only undo. It's not
+        // part of `apply_dist_redirect_incremental` and would inflate
+        // the per-edit number.
         let elapsed = t_total.elapsed();
         total_surgical_redir += elapsed;
         println!(
@@ -713,12 +716,12 @@ fn main() {
         total_redir.as_secs_f64() * 1000.0 / redirect_targets.len().max(1) as f64,
         total_surgical_redir.as_secs_f64() * 1000.0 / redirect_targets.len().max(1) as f64,
     );
-    // Keep the optimizer from dropping the final rebuilt surg_rev on the
-    // floor (the last loop iteration writes it but nothing else reads it).
+    // Keep the optimizer from dropping the final rebuilt surg_rev (last
+    // iteration writes it, nothing reads it).
     std::hint::black_box(&surg_rev);
     println!();
 
-    // ── Phase 6: cascade BFS only (per-click hot path) ───────────────
+    // Phase 6: cascade BFS only (per-click hot path)
     let t = Instant::now();
     let seeds: Vec<u32> = (0..256).map(|i| (i * 4093) as u32).collect();
     for seed in &seeds {
@@ -726,7 +729,7 @@ fn main() {
     }
     let phase_cascade = t.elapsed();
     println!(
-        "phase 6 — cascade_bfs × {}          {phase_cascade:?}",
+        "phase 6: cascade_bfs × {}          {phase_cascade:?}",
         seeds.len()
     );
 
@@ -736,7 +739,7 @@ fn main() {
     std::hint::black_box(&blk_overlay);
 }
 
-// ── helpers ─────────────────────────────────────────────────────────
+// helpers
 
 struct LiteralSwap {
     bit_start: u32,
@@ -746,31 +749,36 @@ struct LiteralSwap {
     new_symbol: u8,
 }
 
-/// Find up to `n` literal events whose Huffman code has at least one
-/// same-length alternative — exactly the set of pixels the app would
-/// list as "editable literal".
-fn find_literal_swaps(events: &[Event], lit_encs: &[EncTable], n: usize) -> Vec<LiteralSwap> {
+/// Find up to `n` literal events whose Huffman code has a same-length
+/// alternative: the pixels the app lists as "editable literal".
+fn find_literal_swaps(
+    events: &[Event],
+    lit_encs: &[EncTable],
+    block_starts: &[u32],
+    n: usize,
+) -> Vec<LiteralSwap> {
     let mut out = Vec::with_capacity(n);
-    for e in events {
+    for (i, e) in events.iter().enumerate() {
         if out.len() >= n {
             break;
         }
         let Event::Lit(lit) = e else {
             continue;
         };
-        let le = &lit_encs[lit.block as usize];
-        let Some((_, cur_clen)) = le.get(lit.symbol as u16) else {
+        let le = &lit_encs[block_of(block_starts, i as u32) as usize];
+        let Some(cur) = le.get(lit.symbol as u16) else {
             continue;
         };
+        let cur_clen = cur.len;
         // Pick the first alternative with matching clen (skip the current).
-        if let Some((alt_sym, alt_code, _)) = le
+        if let Some((alt_sym, alt)) = le
             .iter()
-            .find(|(s, _, cl)| *s < 256 && *s != lit.symbol as u16 && *cl == cur_clen)
+            .find(|(s, sc)| *s < 256 && *s != lit.symbol as u16 && sc.len == cur_clen)
         {
             out.push(LiteralSwap {
                 bit_start: lit.bit_start,
                 code_len: cur_clen,
-                new_code: alt_code,
+                new_code: alt.code,
                 out_pos: lit.out_pos,
                 new_symbol: alt_sym as u8,
             });
@@ -779,9 +787,9 @@ fn find_literal_swaps(events: &[Event], lit_encs: &[EncTable], n: usize) -> Vec<
     out
 }
 
-/// Simulate one filter rebuild keystroke. Mirrors what `app::rebuild_filter`
-/// does: iterate both PixelIndex arrays, format each row's display text
-/// into a reused scratch `String`, and test for substring match.
+/// Simulate one filter-rebuild keystroke. Mirrors `app::rebuild_filter`:
+/// iterate both PixelIndex arrays, format each row's display text into a
+/// reused scratch `String`, test for substring match.
 fn run_filter(pi: &PixelIndex, text: &str, editable_only: bool, scratch: &mut String) -> usize {
     let needle: String = text.to_ascii_lowercase();
     let mut count = 0;
@@ -831,10 +839,9 @@ fn run_filter(pi: &PixelIndex, text: &str, editable_only: bool, scratch: &mut St
     count
 }
 
-/// Test a single row against a Generic needle. Needle is expected to be
-/// already lower-cased. Returns true if the pre-formatted row text
-/// contains the needle. Shared between phase 4 and the narrowing path
-/// so both measure the same per-row cost.
+/// Test a single row against an already-lower-cased needle. True if the
+/// formatted row text contains it. Shared between phase 4 and the
+/// narrowing path so both measure the same per-row cost.
 fn row_matches_generic(
     row: &PixelRow,
     i: u32,
@@ -869,9 +876,9 @@ fn row_matches_generic(
     scratch.contains(needle)
 }
 
-/// A redirect target — the bits to flip + the structural payload the
-/// surgical apply needs (event index, new src, new dist symbol). Mirror
-/// of what `app::edit::EditKind::DistRedirect` carries.
+/// A redirect target: bits to flip + the structural payload the surgical
+/// apply needs (event index, new src, new dist symbol). Mirrors
+/// `app::edit::EditKind::DistRedirect`.
 struct RedirectSwap {
     event_idx: usize,
     bit_start: u32,
@@ -885,30 +892,35 @@ struct RedirectSwap {
     new_dist_sym: u8,
 }
 
-/// Find up to `n` ref events with at least one valid redirect target —
-/// the same predicate `app::select::build_ref_redirect_edits` uses when
-/// listing alternatives in the UI.
-fn find_redirect_swaps(events: &[Event], dist_encs: &[EncTable], n: usize) -> Vec<RedirectSwap> {
+/// Find up to `n` ref events with a valid redirect target, the predicate
+/// `app::select::build_ref_redirect_edits` uses to list UI alternatives.
+fn find_redirect_swaps(
+    events: &[Event],
+    dist_encs: &[EncTable],
+    block_starts: &[u32],
+    n: usize,
+) -> Vec<RedirectSwap> {
     let mut out = Vec::with_capacity(n);
     for (i, e) in events.iter().enumerate() {
         if out.len() >= n {
             break;
         }
         let Event::Ref(r) = e else { continue };
-        let alts = valid_dist_alts(r.block, r.dist_sym, r.out_pos, r.src_out_pos, dist_encs);
+        let block = block_of(block_starts, i as u32);
+        let alts = valid_dist_alts(block, r.dist_sym, r.out_pos, r.src_out_pos, dist_encs);
         let &(new_dsym, new_src, _new_dist) = alts.first().unwrap_or(&(0, 0, 0));
         if alts.is_empty() {
             continue;
         }
-        let de = &dist_encs[r.block as usize];
-        let Some((new_code, new_clen)) = de.get(new_dsym as u16) else {
+        let de = &dist_encs[block as usize];
+        let Some(sc) = de.get(new_dsym as u16) else {
             continue;
         };
         out.push(RedirectSwap {
             event_idx: i,
             bit_start: r.dist_bit_start,
-            code_len: new_clen,
-            new_code,
+            code_len: sc.len,
+            new_code: sc.code,
             out_pos: r.out_pos,
             copy_len: r.copy_len as usize,
             old_src: r.src_out_pos,

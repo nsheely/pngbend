@@ -1,16 +1,24 @@
-//! Coordinate newtypes for the two integer kinds that flow through the
-//! pipeline:
+//! Coordinate newtypes and the pixel↔byte conversion methods on
+//! [`PngInfo`].
 //!
-//! - [`OutPos`] — byte offset within the unfiltered PNG output stream
-//!   (length = `h * row_stride`; includes the per-row filter byte at
-//!   column 0).
-//! - [`PixelXY`] — image-space pixel coordinate (filter bytes excluded).
+//! Two integer kinds flow through the pipeline:
 //!
-//! Conversions go through [`ImgGeom`] which bundles `row_stride`,
-//! `bpp`, `bits_per_pixel`, `w`, and `h`. At sub-byte depths (1/2/4-bit
-//! greyscale or indexed) one byte holds multiple pixels — [`out_to_xy`]
+//! - [`OutPos`]: byte offset within the unfiltered PNG output stream
+//!   (length = `height * row_stride`; includes the per-row filter byte
+//!   at column 0).
+//! - [`PixelXY`]: image-space pixel coordinate (filter bytes excluded).
+//!
+//! Conversions between them are methods on [`PngInfo`], defined here so
+//! the coordinate math lives beside the newtypes it produces while the
+//! type itself stays with the IHDR parser. At sub-byte depths (1/2/4-bit
+//! greyscale or indexed) one byte holds multiple pixels: [`out_to_xy`]
 //! returns the *first* pixel of that byte's cluster, and [`xy_to_out`]
 //! collapses every pixel in a cluster to the same byte position.
+//!
+//! [`out_to_xy`]: PngInfo::out_to_xy
+//! [`xy_to_out`]: PngInfo::xy_to_out
+
+use crate::png::PngInfo;
 
 /// Byte offset in the unfiltered PNG output (the deflate decoder's `output`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,7 +26,12 @@
 pub struct OutPos(pub u32);
 
 /// Image-space pixel coordinate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Deliberately not `Ord`: the app's raster order is `(y, x)`-major,
+/// which a derived field-order comparison (`x` first) would silently
+/// contradict. Sort keys are built explicitly at the call sites that
+/// need them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PixelXY {
     pub x: u32,
     pub y: u32,
@@ -30,39 +43,7 @@ impl PixelXY {
     }
 }
 
-/// Image geometry needed to convert between coordinate spaces.
-#[derive(Debug, Clone, Copy)]
-pub struct ImgGeom {
-    pub w: u32,
-    pub h: u32,
-    /// Bytes per pixel, rounded up — used as the filter-byte offset for
-    /// Sub/Average/Paeth predictors. For sub-byte depths this is 1
-    /// (PNG spec §9.4: filter-byte offset rounds up to whole bytes).
-    pub bpp: u32,
-    /// True bits per pixel: `bit_depth * channels`. 1/2/4 for sub-byte
-    /// greyscale and indexed; 8/16/24/32/48/64 for the byte-aligned
-    /// types. Drives the pixel↔byte arithmetic in [`out_to_xy`] /
-    /// [`xy_to_out`].
-    pub bits_per_pixel: u32,
-    /// Bytes per row including the leading filter byte.
-    pub row_stride: u32,
-}
-
-impl ImgGeom {
-    pub fn new(w: u32, h: u32, bits_per_pixel: u32) -> Self {
-        // Bytes per pixel for filter offset: round up to whole bytes, min 1.
-        let bpp = bits_per_pixel.div_ceil(8).max(1);
-        // Row data bytes: round up so 9 pixels at 1 bpp give 2 bytes, etc.
-        let row_data_bytes = (w * bits_per_pixel).div_ceil(8);
-        Self {
-            w,
-            h,
-            bpp,
-            bits_per_pixel,
-            row_stride: 1 + row_data_bytes,
-        }
-    }
-
+impl PngInfo {
     /// Convert a byte offset in the output stream to pixel coordinates.
     /// Returns `None` for column 0 of any row (the per-row PNG filter
     /// byte). For sub-byte depths the returned `x` is the first pixel
@@ -70,17 +51,18 @@ impl ImgGeom {
     #[inline]
     pub fn out_to_xy(&self, pos: OutPos) -> Option<PixelXY> {
         let p = pos.0;
-        let row = p / self.row_stride;
-        let col = p % self.row_stride;
-        if col == 0 || row >= self.h {
+        let stride = self.row_stride as u32;
+        let row = p / stride;
+        let col = p % stride;
+        if col == 0 || row >= self.height {
             return None;
         }
         // pixel index = byte_in_row * 8 / bits_per_pixel.
-        // 8-bit RGB (bits_per_pixel=24): byte 4 → (3*8)/24 = 1, second
-        // pixel ✓. 1-bit greyscale (bits_per_pixel=1): byte 1 → 0,
-        // cluster start ✓.
+        // 8-bit RGB (bits_per_pixel=24): byte 4 → (3*8)/24 = 1, the
+        // second pixel. 1-bit greyscale (bits_per_pixel=1): byte 1 → 0,
+        // the cluster start.
         let x = ((col - 1) * 8) / self.bits_per_pixel;
-        if x < self.w {
+        if x < self.width {
             Some(PixelXY::new(x, row))
         } else {
             None
@@ -93,7 +75,7 @@ impl ImgGeom {
     #[inline]
     pub fn xy_to_out(&self, xy: PixelXY) -> OutPos {
         let byte_in_row = (xy.x * self.bits_per_pixel) / 8;
-        OutPos(xy.y * self.row_stride + 1 + byte_in_row)
+        OutPos(xy.y * self.row_stride as u32 + 1 + byte_in_row)
     }
 
     /// Number of pixels packed into one byte at this depth. `1` for
@@ -113,28 +95,27 @@ impl ImgGeom {
     #[inline]
     pub fn rgba_index(&self, pos: OutPos) -> Option<usize> {
         let xy = self.out_to_xy(pos)?;
-        Some((xy.y as usize * self.w as usize + xy.x as usize) * 4)
+        Some((xy.y as usize * self.width as usize + xy.x as usize) * 4)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::png::ColorType;
 
     #[test]
     fn out_to_xy_filter_byte_returns_none() {
-        // 4×3 8-bit RGB: bits_per_pixel = 24.
-        let g = ImgGeom::new(4, 3, 24);
+        let g = PngInfo::new(4, 3, 8, ColorType::Rgb);
         assert_eq!(g.out_to_xy(OutPos(0)), None);
-        assert_eq!(g.out_to_xy(OutPos(g.row_stride)), None);
+        assert_eq!(g.out_to_xy(OutPos(g.row_stride as u32)), None);
     }
 
     #[test]
     fn out_to_xy_round_trips_via_xy_to_out() {
-        // 7×5 8-bit RGBA: bits_per_pixel = 32.
-        let g = ImgGeom::new(7, 5, 32);
-        for y in 0..g.h {
-            for x in 0..g.w {
+        let g = PngInfo::new(7, 5, 8, ColorType::Rgba);
+        for y in 0..g.height {
+            for x in 0..g.width {
                 let xy = PixelXY::new(x, y);
                 let pos = g.xy_to_out(xy);
                 assert_eq!(g.out_to_xy(pos), Some(xy));
@@ -144,16 +125,16 @@ mod tests {
 
     #[test]
     fn out_to_xy_past_image_returns_none() {
-        let g = ImgGeom::new(4, 3, 24);
-        // pos at end of last row + 1 → row >= h
-        let past = OutPos(g.h * g.row_stride);
+        let g = PngInfo::new(4, 3, 8, ColorType::Rgb);
+        // pos at end of last row + 1 → row >= height
+        let past = OutPos(g.height * g.row_stride as u32);
         assert!(g.out_to_xy(past).is_none());
     }
 
     #[test]
     fn one_bit_greyscale_packs_eight_pixels_per_byte() {
         // 1-bit greyscale, width 16, height 1. Row is 2 data bytes plus filter.
-        let g = ImgGeom::new(16, 1, 1);
+        let g = PngInfo::new(16, 1, 1, ColorType::Greyscale);
         assert_eq!(g.bpp, 1);
         assert_eq!(g.row_stride, 3);
         assert_eq!(g.pixels_per_byte(), 8);
@@ -173,7 +154,7 @@ mod tests {
     #[test]
     fn four_bit_indexed_packs_two_pixels_per_byte() {
         // 4-bit indexed, width 5, height 1. 5 pixels = 3 bytes (ceil).
-        let g = ImgGeom::new(5, 1, 4);
+        let g = PngInfo::new(5, 1, 4, ColorType::Indexed);
         assert_eq!(g.bpp, 1);
         assert_eq!(g.row_stride, 4);
         assert_eq!(g.pixels_per_byte(), 2);

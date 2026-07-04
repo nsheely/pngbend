@@ -5,7 +5,7 @@
 //!
 //! `apply_edit` dispatches on [`EditKind`]:
 //!
-//! - **Literal swap** — one Huffman code is replaced by another of the
+//! - **Literal swap**: one Huffman code is replaced by another of the
 //!   same length. The output byte at the patched event's position
 //!   becomes the new symbol, and every LZ77 descendant inherits it via
 //!   a BFS over the reverse graph. LZ77 topology is unchanged, so
@@ -14,7 +14,7 @@
 //!   affected rows need to refresh. Cost: `O(affected_rows)` rather
 //!   than `O(image)`.
 //!
-//! - **Distance redirect** — one back-reference's source position moves.
+//! - **Distance redirect**: one back-reference's source position moves.
 //!   LZ77 topology shifts at exactly one event, but the rest of the
 //!   index (every other event's bit / output positions, all literals,
 //!   the per-block Huffman tables) stays valid. The redirect path
@@ -26,6 +26,7 @@
 use crate::bitstream::{read_bits_at, write_bits};
 use crate::deflate::Event;
 use crate::index::event_at;
+use crate::png::ChunkType;
 
 use super::PngBendApp;
 use super::io::CoreData;
@@ -40,6 +41,16 @@ pub(super) struct Patch {
     pub bit_start: u32,
     pub value: u32,
     pub code_len: u8,
+}
+
+/// The output-buffer side of a literal swap: byte at `out_pos` takes
+/// `value`. Captured alongside the deflate-stream [`Patch`] so the
+/// incremental apply path can update `output` (and its LZ77 descendants)
+/// without re-decoding, and so undo can restore the prior bytes.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ByteWrite {
+    pub out_pos: u32,
+    pub value: u8,
 }
 
 /// The patches + kind needed to apply an edit forward and to derive its
@@ -60,16 +71,14 @@ pub(super) enum EditKind {
     /// Same-length Huffman-code literal swap. One entry per patched
     /// channel, naming the output byte and the new symbol value. Every
     /// patch maps to an `Event::Lit`; no LZ77 topology changes.
-    LiteralSwap { byte_updates: Vec<(u32, u8)> },
+    LiteralSwap { byte_updates: Vec<ByteWrite> },
     /// Distance-symbol redirect. The LZ77 source moves but the rest of
-    /// the LZ77 topology (event count, every other event's `out_pos` /
-    /// `copy_len` / channel role) is unchanged — same-length Huffman
-    /// codes guarantee that. So we surgically update `events[i]`,
-    /// recopy `output[out_pos..out_pos+copy_len]` from the new src, and
-    /// propagate downstream via the existing `reverse_graph` — no
-    /// `decode_deflate` needed. The graph itself does need to rebuild
-    /// (one ref's outgoing edges moved from `old_src..` to
-    /// `new_src..`), but that's the only structural index that does.
+    /// the topology (event count, every other event's `out_pos` /
+    /// `copy_len` / channel role) is unchanged: same-length Huffman codes
+    /// guarantee that. Apply updates `events[i]`, recopies
+    /// `output[out_pos..out_pos+copy_len]` from the new src, and
+    /// propagates via a rebuilt `reverse_graph` (one ref's outgoing edges
+    /// moved), the only structural index that moves; no `decode_deflate`.
     DistRedirect {
         /// Output-byte offset of the redirected ref. Doubles as the
         /// "nothing before this can have changed" floor for
@@ -86,7 +95,10 @@ pub(super) enum EditKind {
 
 impl PngBendApp {
     pub(super) fn apply_edit(&mut self) {
-        let Some(action) = self.sel.pending_edit.take() else {
+        let Some(i) = self.sel.selected_edit else {
+            return;
+        };
+        let Some(action) = self.sel.edit_options.get(i).map(|e| e.action.clone()) else {
             return;
         };
         self.sel.selected_edit = None;
@@ -141,12 +153,15 @@ impl PngBendApp {
         match kind {
             EditKind::LiteralSwap { byte_updates } => {
                 // Capture the pre-edit byte at each patched position *before*
-                // mutating the bitstream — undo writes these back.
-                let prior: Vec<(u32, u8)> = {
+                // mutating the bitstream; undo writes these back.
+                let prior: Vec<ByteWrite> = {
                     let c = self.doc.core.as_ref().expect("edit without a loaded file");
                     byte_updates
                         .iter()
-                        .map(|&(out_pos, _)| (out_pos, c.output[out_pos as usize]))
+                        .map(|w| ByteWrite {
+                            out_pos: w.out_pos,
+                            value: c.output[w.out_pos as usize],
+                        })
                         .collect()
                 };
                 let inverse_patches =
@@ -168,8 +183,8 @@ impl PngBendApp {
             } => {
                 // Capture the redirected ref's PRE-edit (src, dist_sym) so
                 // undo flips back to them. The event covering `out_pos`
-                // is unchanged by a redirect — the ref still spans the
-                // same output range — so an `event_at` lookup against the
+                // is unchanged by a redirect (the ref still spans the
+                // same output range), so an `event_at` lookup against the
                 // current events list resolves it.
                 let (event_idx, src_before, dist_sym_before) = {
                     let c = self.doc.core.as_ref().expect("edit without a loaded file");
@@ -215,7 +230,7 @@ impl PngBendApp {
     /// literal event, so the fan-outs of distinct `byte_updates` cannot
     /// overlap. Each visited byte is written exactly once regardless of
     /// traversal order.
-    fn apply_literal_swap_incremental(&mut self, byte_updates: &[(u32, u8)]) {
+    fn apply_literal_swap_incremental(&mut self, byte_updates: &[ByteWrite]) {
         let Some(c) = self.doc.core.as_mut() else {
             return;
         };
@@ -226,7 +241,11 @@ impl PngBendApp {
         // bookkeeping.
         let mut stack: Vec<u32> = Vec::new();
 
-        for &(out_pos, new_byte) in byte_updates {
+        for &ByteWrite {
+            out_pos,
+            value: new_byte,
+        } in byte_updates
+        {
             let pos_us = out_pos as usize;
             c.output[pos_us] = new_byte;
             rows.mark(pos_us);
@@ -263,7 +282,7 @@ impl PngBendApp {
             &rows.touched,
         ) {
             Ok(rebuilt) => {
-                // Row-scoped composite next frame — overlays stay valid
+                // Row-scoped composite next frame; overlays stay valid
                 // because LZ77 topology didn't move.
                 self.view.partial_composite_rows = Some(rebuilt);
                 self.view.texture_dirty = true;
@@ -282,13 +301,13 @@ impl PngBendApp {
     /// position, output range, and block index stays valid; so do
     /// `pixel_index`'s xy and editability flags and the per-block
     /// Huffman tables. That makes a `decode_deflate` + full re-index
-    /// unnecessary — we update the affected pieces in place.
+    /// unnecessary; we update the affected pieces in place.
     ///
     /// Steps:
     /// 1. Patch `events[event_idx]` with the new `src_out_pos` and
     ///    `dist_sym`.
     /// 2. Rebuild `reverse_graph` against the patched events. This must
-    ///    happen **before** the BFS in step 4 — for refs whose source
+    ///    happen **before** the BFS in step 4: for refs whose source
     ///    range overlaps their destination (`src + copy_len > out_pos`),
     ///    edges land within the destination range, and a stale graph
     ///    would let the BFS overwrite correctly recopied bytes through
@@ -296,11 +315,11 @@ impl PngBendApp {
     /// 3. Recopy `output[out_pos..out_pos+copy_len]` from the new src.
     /// 4. Propagate the new bytes through the fresh `reverse_graph` to
     ///    every downstream ref that copies from this destination range.
-    /// 5. Refresh the cached `max_distance` — one ref's distance changed.
+    /// 5. Refresh the cached `max_distance`; one ref's distance changed.
     /// 6. Row-scoped unfilter + RGBA + composite on the touched rows;
     ///    the rest of `unfiltered` and `base_rgba` stays byte-identical.
     ///    `pixel_index.rgb` for the touched rows goes intentionally
-    ///    stale — see the comment at step 6.
+    ///    stale; see the comment at step 6.
     fn apply_dist_redirect_incremental(
         &mut self,
         event_idx: u32,
@@ -412,8 +431,8 @@ impl PngBendApp {
         self.view.overlay_cache.invalidate_distance();
         self.view.cascade_rgba = None;
 
-        if let Some((x, y)) = self.sel.sel_pixel {
-            self.select_pixel(x, y, SelectSource::Refocus);
+        if let Some(sel) = self.sel.sel_pixel {
+            self.select_pixel(sel, SelectSource::Refocus);
         }
     }
 
@@ -425,13 +444,13 @@ impl PngBendApp {
             .chunks
             .iter()
             .scan(false, |idat_seen, c| {
-                if &c.typ == b"IDAT" {
+                if c.typ == ChunkType::IDAT {
                     if *idat_seen {
                         return Some(None); // skip trailing IDATs
                     }
                     *idat_seen = true;
                     Some(Some(crate::png::Chunk {
-                        typ: *b"IDAT",
+                        typ: ChunkType::IDAT,
                         data: zlib.to_vec(),
                     }))
                 } else {
@@ -447,7 +466,7 @@ impl PngBendApp {
     }
 }
 
-// ── free helpers ─────────────────────────────────────────────────────────
+// free helpers
 
 /// Tracks which rows had any byte change during one edit, for the
 /// row-scoped re-render afterwards. Bundles `touched` (per-row flag),
@@ -527,6 +546,18 @@ fn render_affected_rows(
     first_affected: usize,
     row_touched: &[bool],
 ) -> Result<Vec<usize>, String> {
+    // Interlaced output has no single progressive raster to patch row by
+    // row, so reassemble the whole image from the (edited) passes into
+    // `base_rgba`. We return no rebuilt rows: overlays are disabled for
+    // interlaced images, so the texture re-uploads `base_rgba` wholesale
+    // instead of compositing the returned row list.
+    if core.info.interlaced {
+        let full =
+            crate::png::deinterlace_to_rgba8(&core.output, &core.info, core.palette.as_deref())
+                .map_err(|e| format!("deinterlace: {e}"))?;
+        base_rgba.copy_from_slice(&full);
+        return Ok(Vec::new());
+    }
     let mut rebuilt = Vec::with_capacity(row_touched.iter().filter(|b| **b).count() + 4);
     crate::png::unfilter_rows_into(
         &core.output,

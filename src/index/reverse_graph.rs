@@ -1,24 +1,24 @@
 //! Reverse LZ77 dependency graph in compressed-sparse-row form.
 //!
 //! For every source byte position, lists every output position copied
-//! from it. The cascade BFS in [`super::CascadeScratch`] walks this
-//! graph to find every byte downstream of a given output position —
-//! the fan-out of an edit there.
+//! from it. The cascade BFS in [`super::CascadeScratch`] walks this graph
+//! to find every byte downstream of a given output position: the fan-out
+//! of an edit there.
 //!
-//! Two contiguous `Vec<u32>`s: `offsets` sized `output_len + 1` and
-//! `edges` sized to the total ref-byte count across all events. Drop
-//! is `O(1)` (two free calls), no per-source allocation.
+//! Two contiguous `Vec<u32>`s: `offsets` sized `output_len + 1` and `edges`
+//! sized to the total ref-byte count. Drop is `O(1)` (two frees), no
+//! per-source allocation.
 //!
 //! Build is two passes:
 //!
-//! - **Pass 1** counts each source position's out-degree via
-//!   range-update + prefix sum: a ref of length `L` writes two cells
+//! - **Pass 1** counts each source position's out-degree with a
+//!   range-update and prefix sum: a ref of length `L` writes two cells
 //!   (at `src` and `src + L`) instead of `L` increments. For typical
-//!   `copy_len ≈ 5` that's about 2.5× fewer scattered writes to cold
-//!   cache lines; the closing prefix sum is a dense sequential scan.
+//!   `copy_len ≈ 5` that's ~2.5× fewer scattered writes to cold cache
+//!   lines; the closing prefix sum is a dense sequential scan.
 //! - **Pass 2** fills `edges`. A `cursor` Vec (cloned from `offsets`)
-//!   stores the next write index per source, so each ref byte touches
-//!   one cold cache line instead of three.
+//!   holds the next write index per source, so each ref byte touches one
+//!   cold cache line instead of three.
 
 use crate::deflate::Event;
 
@@ -54,20 +54,19 @@ impl ReverseGraph {
 }
 
 pub fn build_reverse_graph(events: &[Event], output_len: usize) -> ReverseGraph {
-    // Pass 1 — count out-degree of every source position via range update.
+    // Pass 1: count out-degree of every source position via range update.
     //
-    // For a ref with `src_out_pos = s, copy_len = L` we want every cell
-    // in `degree[s..s+L]` to gain 1. Recording the delta at the two
-    // endpoints (`+1` at `s`, `−1` at `s+L`) and prefix-summing produces
-    // the same degrees with `O(events)` scattered writes instead of
+    // For a ref with `src_out_pos = s, copy_len = L`, every cell in
+    // `degree[s..s+L]` should gain 1. Recording the delta at the two
+    // endpoints (`+1` at `s`, `−1` at `s+L`) and prefix-summing yields the
+    // same degrees with `O(events)` scattered writes instead of
     // `O(Σ copy_len)`.
     //
-    // The decoder guarantees `s + L ≤ output_len` for every ref (the
-    // source must already be in `output` when the ref is emitted), so
-    // both writes are in bounds against `delta` of length `output_len + 1`.
-    // The unchecked writes skip `Vec::index_mut`'s precondition chain,
-    // which `perf` measured as a noticeable fraction of build time on
-    // multi-million-event inputs.
+    // The decoder guarantees `s + L ≤ output_len` for every ref (the source
+    // is already in `output` when the ref is emitted), so both writes are in
+    // bounds against `delta` of length `output_len + 1`. The unchecked
+    // writes skip `Vec::index_mut`'s precondition chain, a noticeable
+    // fraction of build time on multi-million-event inputs per `perf`.
     let mut delta: Vec<i32> = vec![0; output_len + 1];
     for e in events {
         if let Event::Ref(r) = e {
@@ -100,7 +99,7 @@ pub fn build_reverse_graph(events: &[Event], output_len: usize) -> ReverseGraph 
 
     drop(delta);
 
-    // Pass 2 — fill edges. `cursor` is a writable copy of `offsets` that
+    // Pass 2: fill edges. `cursor` is a writable copy of `offsets` that
     // tracks the next free edge slot per source. Each ref byte does one
     // cursor read/increment + one edges write, leaving the canonical
     // `offsets` untouched for [`ReverseGraph::neighbors`] queries.
@@ -108,7 +107,7 @@ pub fn build_reverse_graph(events: &[Event], output_len: usize) -> ReverseGraph 
     // Invariants: `slot_idx = s + offset < s + L ≤ output_len <
     // cursor.len()`, so the cursor lookup is in bounds. `cursor[slot_idx]`
     // starts at `offsets[slot_idx]` and increments at most
-    // `degree[slot_idx]` times — never past `offsets[slot_idx + 1] ≤
+    // `degree[slot_idx]` times, never past `offsets[slot_idx + 1] ≤
     // total_edges`.
     let mut cursor: Vec<u32> = offsets.clone();
     let mut edges: Vec<u32> = vec![0u32; total_edges];
@@ -143,7 +142,6 @@ mod tests {
             src_out_pos,
             copy_len,
             dist_sym: 0,
-            block: 0,
             dist_bit_start: 0,
         })
     }
@@ -153,7 +151,6 @@ mod tests {
             out_pos,
             symbol: 0,
             bit_start: 0,
-            block: 0,
         })
     }
 

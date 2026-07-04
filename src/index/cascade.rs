@@ -1,19 +1,19 @@
-//! Epoch-versioned BFS scratch for the "what bytes downstream depend on
+//! Epoch-versioned BFS scratch for the "which downstream bytes depend on
 //! this edit" query.
 //!
-//! `CascadeScratch` is held on the app across clicks. Its `depth_map`
-//! is a dense per-output-byte table allocated once per file; bumping
-//! the `epoch` byte at the start of each run invalidates every stale
-//! entry in O(1) without re-zeroing.
+//! `CascadeScratch` is held on the app across clicks. Its `depth_map` is a
+//! dense per-output-byte table allocated once per file; bumping the `epoch`
+//! byte at the start of each run invalidates every stale entry in O(1)
+//! without re-zeroing.
 //!
-//! Each slot is a packed `u16`: high byte = run epoch, low byte = BFS
-//! depth (saturating at 255). 2 bytes per output byte → 24 MB for a
-//! 12 MB output buffer, half what `(epoch: u32, depth: u8)` would take,
-//! so the BFS reads from a table that fits in L3.
+//! Each slot is a packed `u16`: high byte = run epoch, low byte = BFS depth
+//! (saturating at 255). 2 bytes per output byte → 24 MB for a 12 MB output
+//! buffer, half what `(epoch: u32, depth: u8)` would take, so the BFS reads
+//! from a table that fits in L3.
 //!
-//! The epoch is 8 bits and wraps every 256 runs. On wrap the map is
-//! zeroed once and the epoch restarts at 1: ~0.8 ms per 256-run cycle
-//! (≈ 3 µs/run amortised).
+//! The 8-bit epoch wraps every 256 runs. On wrap the map is zeroed once and
+//! the epoch restarts at 1: ~0.8 ms per 256-run cycle (≈ 3 µs/run
+//! amortised).
 
 use super::reverse_graph::ReverseGraph;
 
@@ -70,9 +70,9 @@ impl CascadeScratch {
             self.depth_map.resize(n, 0);
             self.epoch_shifted = 0;
         }
-        // Advance the epoch. With only 8 bits of epoch we wrap every 256
-        // runs; on wrap we zero the entire table once and restart at
-        // epoch=1 so the new run's slots are unambiguously fresh.
+        // Advance the epoch. 8 bits wrap every 256 runs; on wrap, zero the
+        // whole table once and restart at epoch=1 so the new run's slots
+        // are unambiguously fresh.
         self.epoch_shifted = self.epoch_shifted.wrapping_add(1 << EPOCH_SHIFT);
         if self.epoch_shifted & EPOCH_MASK == 0 {
             self.depth_map.fill(0);
@@ -95,10 +95,9 @@ impl CascadeScratch {
             }
         }
 
-        // BFS using `affected` itself as a Vec-queue: push at the end,
-        // walk a local `head` index forward. Each node is enqueued once
-        // (the visited stamp guards), so when `head` catches up to `len`
-        // we're done.
+        // BFS using `affected` itself as a Vec-queue: push at the end, walk
+        // a local `head` index forward. Each node is enqueued once (the
+        // visited stamp guards), so `head` reaching `len` means done.
         let mut head = 0usize;
         while head < self.affected.len() {
             let pos = self.affected[head];
@@ -165,7 +164,6 @@ mod tests {
                         src_out_pos: src as u32,
                         copy_len: 1,
                         dist_sym: 0,
-                        block: 0,
                         dist_bit_start: 0,
                     })
                 })
@@ -214,8 +212,8 @@ mod tests {
 
     #[test]
     fn scratch_reuses_across_runs() {
-        // Two unrelated runs on the same scratch must give independent results
-        // — no leak from the first run's depths.
+        // Two unrelated runs on the same scratch must give independent results,
+        // with no leak from the first run's depths.
         let rev_a = rev_from_adj(&[vec![1], vec![2], vec![]]);
         let rev_b = rev_from_adj(&[vec![], vec![], vec![0]]);
         let mut scratch = CascadeScratch::new();

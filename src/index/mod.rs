@@ -1,6 +1,6 @@
 //! Derived indices over a decoded DEFLATE stream: event lookup tables, the
-//! LZ77 reverse graph, the cascade BFS scratch, and the pixel-level summary
-//! displayed in the side panel.
+//! LZ77 reverse graph, the cascade BFS scratch, and the side-panel pixel
+//! summary.
 
 mod cascade;
 mod pixel;

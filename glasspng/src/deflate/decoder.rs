@@ -9,7 +9,7 @@ use crate::bitstream::BitReader;
 use super::constants::{CLORDER, DBASE, DEXT, LBASE, LEXT};
 use super::error::DecodeError;
 use super::events::{EncTable, Event, LitEvent, RefEvent};
-use super::huffman::{HuffmanTable, build_tree, decode_sym};
+use super::huffman::{HuffmanTable, build_tree, decode_sym, fixed_code_lengths};
 
 #[derive(Debug)]
 pub struct DecodedDeflate {
@@ -17,25 +17,80 @@ pub struct DecodedDeflate {
     pub events: Vec<Event>,
     pub lit_encs: Vec<EncTable>,
     pub dist_encs: Vec<EncTable>,
-    pub num_blocks: usize,
+    /// `block_starts[b]` is the index into `events` of block `b`'s first
+    /// event. A block owns the half-open event range
+    /// `block_starts[b] .. block_starts[b + 1]` (the last block runs to
+    /// `events.len()`). Block membership is a range recorded once per
+    /// block, not a field on every event. Look up an event's block with
+    /// [`block_of`](super::block_of).
+    pub block_starts: Vec<u32>,
     /// Largest LZ77 back-reference distance found in `events`, or 1 if
     /// no back-references were emitted. Cached here so consumers (e.g.
     /// the distance-overlay colour scaler) don't need a second event scan.
     pub max_distance: u32,
 }
 
-/// Mutable state threaded through the per-block decoders: the output
-/// buffer, event log, running max-distance, and the optional output cap.
-/// Bundled into one struct so the helpers don't drift toward a
-/// many-argument signature as the decoder grows.
-struct DecodeState<'a> {
+impl DecodedDeflate {
+    /// Number of DEFLATE blocks in the stream, one `block_starts` entry
+    /// per block.
+    #[inline]
+    pub fn num_blocks(&self) -> usize {
+        self.block_starts.len()
+    }
+}
+
+/// Receives one call per literal / back-reference the decoder emits. The
+/// full [`decode_deflate`] path collects them into a `Vec<Event>`; the
+/// pixels-only [`inflate`] path uses [`NoEvents`], whose no-op methods let
+/// the compiler dead-code-eliminate the event construction so the shared
+/// byte-producing loop carries zero recording overhead on the fast path.
+trait EventSink {
+    fn lit(&mut self, ev: LitEvent);
+    fn reference(&mut self, ev: RefEvent);
+    /// Events recorded so far: the index a new block starts at.
+    fn count(&self) -> u32;
+}
+
+impl EventSink for Vec<Event> {
+    #[inline]
+    fn lit(&mut self, ev: LitEvent) {
+        self.push(Event::Lit(ev));
+    }
+    #[inline]
+    fn reference(&mut self, ev: RefEvent) {
+        self.push(Event::Ref(ev));
+    }
+    #[inline]
+    fn count(&self) -> u32 {
+        self.len() as u32
+    }
+}
+
+/// Discarding sink for [`inflate`]: every method is a no-op the optimiser
+/// erases, along with the [`LitEvent`] / [`RefEvent`] built to feed it.
+struct NoEvents;
+
+impl EventSink for NoEvents {
+    #[inline]
+    fn lit(&mut self, _ev: LitEvent) {}
+    #[inline]
+    fn reference(&mut self, _ev: RefEvent) {}
+    #[inline]
+    fn count(&self) -> u32 {
+        0
+    }
+}
+
+/// Mutable state threaded through the per-block decoders: output buffer,
+/// event sink, running max-distance, and the output cap.
+struct DecodeState<'a, E: EventSink> {
     output: &'a mut Vec<u8>,
-    events: &'a mut Vec<Event>,
+    events: &'a mut E,
     max_distance: &'a mut u32,
     max_output: Option<usize>,
 }
 
-impl DecodeState<'_> {
+impl<E: EventSink> DecodeState<'_, E> {
     /// Bail when extending `output` by `additional` bytes would exceed
     /// the cap. Inlined into the literal- and ref-emit hot paths.
     #[inline]
@@ -52,43 +107,56 @@ impl DecodeState<'_> {
     }
 }
 
-/// Decode a raw deflate stream. `max_output` caps the inflated size in
-/// bytes (`None` for unbounded); the loader passes the IHDR-derived
-/// expected output so a malicious IDAT can't pump the decoder into
-/// gigabytes of allocation.
-pub fn decode_deflate(
+/// The non-event products of a decode: the inflated bytes plus the per-
+/// block Huffman tables, block boundaries, and max back-ref distance that
+/// [`decode_deflate`] surfaces (and [`inflate`] discards).
+struct Inflated {
+    output: Vec<u8>,
+    lit_encs: Vec<EncTable>,
+    dist_encs: Vec<EncTable>,
+    block_starts: Vec<u32>,
+    max_distance: u32,
+}
+
+/// Shared decode core, generic over the event sink so the recording and
+/// pixels-only paths share one implementation of every block type and
+/// every RFC 1951 validity check.
+fn decode_into<E: EventSink>(
     data: &[u8],
     max_output: Option<usize>,
-) -> Result<DecodedDeflate, DecodeError> {
+    events: &mut E,
+) -> Result<Inflated, DecodeError> {
     let mut reader = BitReader::new(data);
-    // Output and event vectors grow on demand. Up-front preallocation
-    // sized from the deflate length measures slower on typical photo
-    // PNGs — wasted capacity hurts L2 reuse more than the doublings cost.
+    // Output grows on demand. Up-front preallocation sized from the deflate
+    // length measures slower on typical photo PNGs; wasted capacity hurts
+    // L2 reuse more than the doublings cost.
     let mut output: Vec<u8> = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
     let mut lit_encs: Vec<EncTable> = Vec::new();
     let mut dist_encs: Vec<EncTable> = Vec::new();
+    let mut block_starts: Vec<u32> = Vec::new();
     let mut max_distance = 1u32;
     let mut block_idx = 0u32;
 
     let mut state = DecodeState {
         output: &mut output,
-        events: &mut events,
+        events,
         max_distance: &mut max_distance,
         max_output,
     };
 
     loop {
+        // Each block owns the event range starting here.
+        block_starts.push(state.events.count());
         let is_final = reader.read_bits(1);
         let block_type = reader.read_bits(2);
 
         match block_type {
             0b00 => {
                 decode_stored_block(&mut reader, &mut state, block_idx)?;
-                // A stored block carries no Huffman alphabet, but every
-                // event still records a `block` index that downstream code
-                // uses to look up the table. Push placeholder empty tables
-                // sized to the standard alphabets so indexing stays valid.
+                // A stored block carries no Huffman alphabet, but block →
+                // table lookups still index by block, so push placeholder
+                // empty tables sized to the standard alphabets to keep the
+                // per-block indices aligned.
                 lit_encs.push(EncTable::new(288));
                 dist_encs.push(EncTable::new(30));
             }
@@ -111,19 +179,49 @@ pub fn decode_deflate(
         }
     }
 
-    Ok(DecodedDeflate {
+    Ok(Inflated {
         output,
-        events,
         lit_encs,
         dist_encs,
-        num_blocks: block_idx as usize,
+        block_starts,
         max_distance,
     })
 }
 
-fn decode_stored_block(
+/// Decode a raw deflate stream, recording every literal and back-reference
+/// as an [`Event`] and keeping the per-block Huffman tables: the glass-box
+/// path. `max_output` caps the inflated size in bytes (`None` for
+/// unbounded); the loader passes the IHDR-derived expected output so a
+/// malicious IDAT can't pump the decoder into gigabytes of allocation.
+///
+/// Use [`inflate`] when you only need the decompressed bytes.
+pub fn decode_deflate(
+    data: &[u8],
+    max_output: Option<usize>,
+) -> Result<DecodedDeflate, DecodeError> {
+    let mut events: Vec<Event> = Vec::new();
+    let inflated = decode_into(data, max_output, &mut events)?;
+    Ok(DecodedDeflate {
+        output: inflated.output,
+        events,
+        lit_encs: inflated.lit_encs,
+        dist_encs: inflated.dist_encs,
+        block_starts: inflated.block_starts,
+        max_distance: inflated.max_distance,
+    })
+}
+
+/// Decompress a raw deflate stream to its output bytes only: no event log,
+/// no per-symbol allocation. The lean path behind
+/// [`crate::decode`]. `max_output` behaves as in [`decode_deflate`].
+pub fn inflate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, DecodeError> {
+    let mut sink = NoEvents;
+    Ok(decode_into(data, max_output, &mut sink)?.output)
+}
+
+fn decode_stored_block<E: EventSink>(
     reader: &mut BitReader,
-    state: &mut DecodeState<'_>,
+    state: &mut DecodeState<'_, E>,
     block_idx: u32,
 ) -> Result<(), DecodeError> {
     reader.align_to_byte();
@@ -143,12 +241,12 @@ fn decode_stored_block(
     for _ in 0..length {
         let bit_start = reader.bit_pos() as u32;
         let byte_val = reader.read_bits(8) as u8;
-        state.events.push(Event::Lit(LitEvent {
-            out_pos: state.output.len() as u32,
+        let out_pos = state.output.len() as u32;
+        state.events.lit(LitEvent {
+            out_pos,
             symbol: byte_val,
             bit_start,
-            block: block_idx,
-        }));
+        });
         state.output.push(byte_val);
     }
     Ok(())
@@ -162,12 +260,7 @@ fn read_huffman_code_lengths(
     block_type: u32,
 ) -> Result<(Vec<u32>, Vec<u32>), DecodeError> {
     if block_type == 0b01 {
-        let mut ll = vec![0u32; 288];
-        ll[..144].fill(8);
-        ll[144..256].fill(9);
-        ll[256..280].fill(7);
-        ll[280..288].fill(8);
-        return Ok((ll, vec![5u32; 32]));
+        return Ok(fixed_code_lengths());
     }
 
     let hlit = reader.read_bits(5) + 257;
@@ -203,15 +296,15 @@ fn read_huffman_code_lengths(
     }
     // First `hlit` entries are literal-alphabet code lengths, the rest
     // are distance-alphabet code lengths. `split_off` hands the tail to a
-    // new Vec and shrinks the original — one allocation rather than two.
+    // new Vec and shrinks the original: one allocation rather than two.
     let dl = all_lengths.split_off(hlit as usize);
     let ll = all_lengths;
     Ok((ll, dl))
 }
 
-fn decode_huffman_block(
+fn decode_huffman_block<E: EventSink>(
     reader: &mut BitReader,
-    state: &mut DecodeState<'_>,
+    state: &mut DecodeState<'_, E>,
     block_idx: u32,
     lit: &HuffmanTable,
     dist: &HuffmanTable,
@@ -226,12 +319,12 @@ fn decode_huffman_block(
 
         if sym < 256 {
             state.check_room(1)?;
-            state.events.push(Event::Lit(LitEvent {
-                out_pos: state.output.len() as u32,
+            let out_pos = state.output.len() as u32;
+            state.events.lit(LitEvent {
+                out_pos,
                 symbol: sym as u8,
                 bit_start: sym_bit_start as u32,
-                block: block_idx,
-            }));
+            });
             state.output.push(sym as u8);
         } else {
             let len_idx = (sym - 257) as usize;
@@ -243,7 +336,7 @@ fn decode_huffman_block(
             let dist_bit_start = reader.bit_pos() as u32;
             let dist_sym_u16 = decode_sym(reader, dist)?;
             // RFC 1951: distance alphabet is 30 symbols (0..=29). Symbols
-            // 30 and 31 are reserved and must not occur in valid data —
+            // 30 and 31 are reserved and must not occur in valid data;
             // `DBASE`/`DEXT` only define 30 entries, so without this
             // guard a malformed stream panics with an out-of-bounds index.
             if dist_sym_u16 >= 30 {
@@ -268,18 +361,18 @@ fn decode_huffman_block(
             }
             let src_start = state.output.len() - distance as usize;
 
-            state.events.push(Event::Ref(RefEvent {
-                out_pos: state.output.len() as u32,
+            let out_pos = state.output.len() as u32;
+            state.events.reference(RefEvent {
+                out_pos,
                 src_out_pos: src_start as u32,
                 copy_len: copy_len as u16,
                 dist_sym,
-                block: block_idx,
                 dist_bit_start,
-            }));
+            });
 
             // When distance < copy_len the source range overlaps the
             // destination, and each push extends the bytes a later
-            // iteration will read — the run-length-encoding pattern that
+            // iteration will read: the run-length-encoding pattern that
             // makes "copy 64 bytes from one byte back" expand a single
             // byte into 64. A bulk `copy_within` / `copy_from_slice`
             // would snapshot the source slice and lose that semantic.
@@ -311,7 +404,11 @@ mod tests {
         let result = decode_deflate(&buf, None).expect("decode");
         assert_eq!(result.output, b"hi");
         assert_eq!(result.events.len(), 2);
-        assert_eq!(result.num_blocks, 1);
+        assert_eq!(result.num_blocks(), 1);
+
+        // The event-free fast path must produce byte-identical output.
+        let bytes = inflate(&buf, None).expect("inflate");
+        assert_eq!(bytes, result.output);
     }
 
     #[test]
@@ -349,7 +446,7 @@ mod tests {
     #[test]
     fn rejects_stored_block_with_bad_length_complement() {
         // BFINAL=1, BTYPE=00, then byte-aligned LEN=2, NLEN=0 (not the
-        // one's complement of LEN — the spec demands LEN ^ NLEN == 0xFFFF).
+        // one's complement of LEN; the spec demands LEN ^ NLEN == 0xFFFF).
         let mut buf = vec![0u8; 16];
         // BFINAL=1 at bit 0, BTYPE=00 at bits 1..2.
         write_bits(&mut buf, 0, 1, 1);
@@ -357,7 +454,7 @@ mod tests {
         // (LSB first) at byte 1.
         buf[1] = 2; // LEN low
         buf[2] = 0; // LEN high
-        buf[3] = 0; // NLEN low (wrong — should be ~LEN)
+        buf[3] = 0; // NLEN low (wrong; should be ~LEN)
         buf[4] = 0; // NLEN high
         let err = decode_deflate(&buf, None).unwrap_err();
         assert!(
@@ -375,50 +472,22 @@ mod tests {
 
     #[test]
     fn rejects_reserved_distance_symbol_30() {
-        // Hand-build a dynamic block whose distance alphabet has exactly
-        // one present symbol (30) with a 1-bit code. Any back-reference
-        // therefore decodes to dist_sym=30 — which RFC 1951 reserves.
-        //
-        // Block layout (BTYPE=10):
-        //   HLIT  = 0  (257 literal codes — minimum)
-        //   HDIST = 30 (31 distance codes 0..=30 — includes reserved 30)
-        //   HCLEN = 0  (4 code-length codes; CLORDER prefix is [16,17,18,0])
-        //
-        // Code-length alphabet: only symbol 18 (long zero run, 7-bit
-        // length) gets a code — clen=1. With one 1-bit symbol the
-        // canonical Huffman encoding is degenerate (two-symbol minimum
-        // applies in practice but `build_tree` accepts it: a 1-bit code
-        // for sym 18 means every peek decodes to it).
-        //
-        // Then we emit:
-        //   sym=18, repeat-zero count = 257-11 = 246 → fills lit alphabet
-        //   sym=18, repeat-zero count = 137-11 = 126 → fills dist alphabet
-        //                                              up to symbol 30…
-        //   …actually a 1-bit Huffman with one symbol is ill-formed —
-        //   `build_tree` would assign it code 0, leaving 1 with no
-        //   match. So instead we use two 1-bit symbols.
-        //
-        // Simpler path: HCLEN=4 with two 1-bit code-length symbols,
-        // sym 0 (clen=0) and sym 1 (clen=1), so the alphabet sees 0/1
-        // bit-by-bit. We then emit:
-        //   sym=1 ×257 → all lit lengths = 1 (well-formed if alphabet
-        //                has exactly 2 syms; we'd need 256 such literals
-        //                +1 EOB = 257 with clen=1 but canonical Huffman
-        //                only allows 2 syms with clen=1).
-        //
-        // Both of those run aground on canonical-Huffman well-formedness.
-        // The pragmatic test: drive `decode_huffman_block` directly with
-        // a synthetic dist `HuffmanTable` containing only sym=30.
+        // A back-reference whose distance symbol is 30 must be rejected:
+        // RFC 1951 defines only distance symbols 0..=29. Hand-encoding a
+        // full dynamic block to reach that state is awkward, because a
+        // single-symbol distance alphabet is degenerate under canonical
+        // Huffman. Drive `decode_huffman_block` directly with synthetic
+        // lit and dist tables whose dist table has sym 30 present.
         use super::super::huffman::build_tree;
-        // Lit alphabet: sym 256 (EOB) and sym 257 (length-3) at clen=1
-        // — two 1-bit canonical codes (code 0 and code 1).
+        // Lit alphabet: sym 256 (EOB) and sym 257 (length-3) at clen=1,
+        // two 1-bit canonical codes (code 0 and code 1).
         let mut lit_lengths = vec![0u32; 258];
         lit_lengths[256] = 1; // EOB → code 0
         lit_lengths[257] = 1; // length-3 → code 1
         let (lit_tab, _) = build_tree(&lit_lengths).expect("valid lit set");
 
-        // Dist alphabet: sym 29 and sym 30 at clen=1 — sym 29 → code 0,
-        // sym 30 → code 1 (the reserved-symbol case we want to trigger).
+        // Dist alphabet: sym 29 and sym 30 at clen=1: sym 29 → code 0,
+        // sym 30 → code 1 (the reserved-symbol case to trigger).
         let mut dist_lengths = vec![0u32; 31];
         dist_lengths[29] = 1;
         dist_lengths[30] = 1;
@@ -427,10 +496,10 @@ mod tests {
         // Build a buffer: bit 0 = read sym 257 (1 bit). Then no extra
         // length bits for LBASE[0]=3 (LEXT[0]=0). Then dist sym = 30
         // (1 bit, code 1 since sym 29 got code 0). Then would read
-        // DEXT[30] extra bits — but we error before that.
+        // DEXT[30] extra bits, but decoding errors before that.
         //
         // First bit: 1 (sym 257 → length 3).
-        // Next bit: 1 (dist sym 30 — second 1-bit code).
+        // Next bit: 1 (dist sym 30, second 1-bit code).
         let mut buf = vec![0u8; 8];
         write_bits(&mut buf, 0, 0b11, 2);
 

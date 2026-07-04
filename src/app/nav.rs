@@ -1,5 +1,4 @@
 use super::PngBendApp;
-use super::overlay_cache::OverlayMode;
 use super::select::SelectSource;
 
 impl PngBendApp {
@@ -24,7 +23,6 @@ impl PngBendApp {
 
         if esc {
             self.sel.sel_pixel = None;
-            self.sel.pending_edit = None;
             self.sel.selected_edit = None;
             self.sel.edit_options.clear();
             self.sel.backref_src = None;
@@ -42,13 +40,13 @@ impl PngBendApp {
         } else if pgdn {
             Some(self.list.list_viewport_rows as isize)
         } else if home && n_pixels > 0 {
-            if let Some((nx, ny)) = self.filtered_xy(0) {
-                self.select_pixel(nx, ny, SelectSource::ListNav);
+            if let Some(xy) = self.filtered_xy(0) {
+                self.select_pixel(xy, SelectSource::ListNav);
             }
             None
         } else if end && n_pixels > 0 {
-            if let Some((nx, ny)) = self.filtered_xy(n_pixels - 1) {
-                self.select_pixel(nx, ny, SelectSource::ListNav);
+            if let Some(xy) = self.filtered_xy(n_pixels - 1) {
+                self.select_pixel(xy, SelectSource::ListNav);
             }
             None
         } else {
@@ -62,9 +60,9 @@ impl PngBendApp {
             let next =
                 (row as isize + delta).clamp(0, n_pixels.saturating_sub(1) as isize) as usize;
             if next != row
-                && let Some((nx, ny)) = self.filtered_xy(next)
+                && let Some(next_xy) = self.filtered_xy(next)
             {
-                self.select_pixel(nx, ny, SelectSource::ListNav);
+                self.select_pixel(next_xy, SelectSource::ListNav);
             }
         }
 
@@ -121,19 +119,18 @@ impl PngBendApp {
         let Some(c) = self.doc.core.as_ref() else {
             return;
         };
-        if matches!(
-            self.view.overlay_mode,
-            OverlayMode::None | OverlayMode::Cascade
-        ) {
+        let Some(overlay) = self.view.overlay_mode.event_overlay() else {
+            return;
+        };
+        // The Literals/Distance/Blocks overlays paint pixels via the
+        // progressive layout, so they're skipped for interlaced images (the
+        // base image still renders).
+        if !c.overlays_supported() {
             return;
         }
-        let geom = c.geom;
-        self.view.overlay_cache.ensure(
-            self.view.overlay_mode,
-            &c.events,
-            &geom,
-            c.num_blocks,
-            c.max_distance,
-        );
+        let info = c.info;
+        self.view
+            .overlay_cache
+            .ensure(overlay, &c.events, &info, &c.block_starts, c.max_distance);
     }
 }

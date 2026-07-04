@@ -5,7 +5,7 @@
 //! every filter keystroke from "clone N strings" into "copy N u32s".
 //!
 //! Predicates take `FnMut(FilterRef, &PixelRow) -> bool` so callers can
-//! amortise a scratch buffer across rows — the text-matching path formats
+//! amortise a scratch buffer across rows: the text-matching path formats
 //! each row on demand and reuses the same `String` scratch across the
 //! entire rebuild.
 
@@ -35,7 +35,7 @@ impl FilterRef {
         }
     }
 
-    /// 1-based display index for the sidebar row — `i + 1` for either arm.
+    /// 1-based display index for the sidebar row: `i + 1` for either arm.
     #[inline]
     pub fn display_index(self) -> u32 {
         match self {
@@ -114,31 +114,31 @@ fn sort_key(r: &PixelRow) -> (u32, u32) {
     (r.y(), r.x())
 }
 
-// ── structured filter predicates ──────────────────────────────────────
+// structured filter predicates
 //
 // The filter box accepts a few structured shapes (`#rrggbb`, `d=N`,
-// `len=N`, `x,y`, …). Parsing them once per keystroke makes the
-// per-row check `O(1)` arithmetic on fields the row already carries —
+// `len=N`, `x,y`, ...). Parsing them once per keystroke makes the
+// per-row check `O(1)` arithmetic on fields the row already carries:
 // no per-row formatting, lower-casing, or substring scan. Anything the
 // parser doesn't recognise falls into the [`FilterSpec::Generic`] arm,
 // which is the only one that touches the formatter at all.
 
 #[derive(Debug, Clone)]
 pub(super) enum FilterSpec {
-    /// Empty filter — every row passes.
+    /// Empty filter: every row passes.
     All,
     /// `#rrggbb` (or shorter, byte-aligned). `n_bytes` of `bytes` must
     /// match the start of `PixelRow.rgb`.
     HexPrefix { n_bytes: u8, bytes: [u8; 3] },
-    /// `d=N` / `dist=N` — a ref row whose LZ77 distance equals N.
+    /// `d=N` / `dist=N`: a ref row whose LZ77 distance equals N.
     Dist(usize),
-    /// `len=N` — a ref row whose copy length equals N.
+    /// `len=N`: a ref row whose copy length equals N.
     Len(u16),
-    /// `X,Y` — exact pixel coordinates.
+    /// `X,Y`: exact pixel coordinates.
     Coord(u32, u32),
-    /// `,Y` — any pixel with y == Y.
+    /// `,Y`: any pixel with y == Y.
     CoordRow(u32),
-    /// `X,` — any pixel with x == X.
+    /// `X,`: any pixel with x == X.
     CoordCol(u32),
     /// Fallback: format each row's display text, lowercase, and substring
     /// match. `String` is pre-lowercased at parse time.
@@ -188,7 +188,7 @@ impl FilterSpec {
         FilterSpec::Generic(t.to_ascii_lowercase())
     }
 
-    /// Evaluate against one row. `scratch` is reused across rows — only
+    /// Evaluate against one row. `scratch` is reused across rows; only
     /// the `Generic` arm actually writes into it, so warm `HexPrefix` /
     /// `Dist` / `Coord` matches don't touch the allocator.
     pub(super) fn matches(
@@ -212,7 +212,7 @@ impl FilterSpec {
                 matches!(fref, FilterRef::Ref(_))
                     && lookup_ref_metrics(c, row.xy()).is_some_and(|(_, len)| len == *n)
             }
-            FilterSpec::Coord(x, y) => row.xy() == (*x, *y),
+            FilterSpec::Coord(x, y) => row.x() == *x && row.y() == *y,
             FilterSpec::CoordRow(y) => row.y() == *y,
             FilterSpec::CoordCol(x) => row.x() == *x,
             FilterSpec::Generic(needle) => {
@@ -224,11 +224,10 @@ impl FilterSpec {
         }
     }
 
-    /// True if every row matching `self` also matches `other` — i.e. the
-    /// set of matches of `self` is a subset of the set of matches of
-    /// `other`. When `rebuild_filter` detects this on a keystroke, it
-    /// only re-tests rows currently in `filtered_view` instead of
-    /// rescanning the whole `PixelIndex`.
+    /// True if every row matching `self` also matches `other`: its match
+    /// set is a subset of `other`'s. When `rebuild_filter` detects this on
+    /// a keystroke, it only re-tests rows currently in `filtered_view`
+    /// instead of rescanning the whole `PixelIndex`.
     ///
     /// Conservative: returns `false` for any cross-type transition (e.g.
     /// `Coord(x,y)` → `CoordRow(y)`) where correctness would need a more
@@ -299,7 +298,7 @@ mod tests {
     use super::*;
 
     fn row(x: u32, y: u32, has_edit: bool) -> PixelRow {
-        PixelRow::new(x, y, [0, 0, 0], has_edit)
+        PixelRow::new(crate::coords::PixelXY::new(x, y), [0, 0, 0], has_edit)
     }
 
     fn pi() -> PixelIndex {
@@ -361,7 +360,7 @@ mod tests {
         assert_eq!(FilterRef::Ref(7).display_index(), 8);
     }
 
-    // ── FilterSpec parsing ─────────────────────────────────────────────
+    // FilterSpec parsing
 
     #[test]
     fn parse_empty_and_whitespace_is_all() {
@@ -423,8 +422,8 @@ mod tests {
 
     #[test]
     fn parse_bare_integer_is_generic() {
-        // Single integer is ambiguous (could be x, y, or part of #hex) —
-        // fall back to the substring path rather than guess.
+        // Single integer is ambiguous (could be x, y, or part of #hex),
+        // so fall back to the substring path rather than guess.
         assert!(matches!(FilterSpec::parse("42"), FilterSpec::Generic(_)));
     }
 
@@ -436,7 +435,7 @@ mod tests {
         }
     }
 
-    // ── is_refinement_of ──────────────────────────────────────────────────
+    // is_refinement_of
 
     #[test]
     fn refinement_generic_prefix_growth() {
@@ -470,7 +469,7 @@ mod tests {
 
     #[test]
     fn refinement_hexprefix_divergent() {
-        // Different first byte — not a refinement.
+        // Different first byte, not a refinement.
         let a = FilterSpec::parse("#aa");
         let b = FilterSpec::parse("#bb");
         assert!(!b.is_refinement_of(&a));

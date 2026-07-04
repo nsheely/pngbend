@@ -1,0 +1,19 @@
+[package]
+name = "glasspng"
+version = "0.1.0"
+edition = "2024"
+description = "Glass-box PNG codec: decode to pixels, or inspect the DEFLATE literal/back-reference event stream and per-block Huffman tables behind each pixel, then re-emit a valid PNG after editing."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/nsheely/pngbend"
+keywords = ["png", "deflate", "lz77", "compression", "codec"]
+categories = ["graphics", "multimedia::images", "compression"]
+
+[dev-dependencies]
+# Reference decoder for the PngSuite conformance test.
+png = "0.17"
+# Property-based round-trip testing for the encoder.
+proptest = "1"
+
+[lints]
+workspace = true

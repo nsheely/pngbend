@@ -19,7 +19,7 @@ pub enum DecodeError {
         block_idx: u32,
     },
     /// Distance alphabet decoded a symbol >= 30. RFC 1951 reserves 30 and
-    /// 31 — they must not occur in a valid stream, and `DBASE`/`DEXT` only
+    /// 31: they must not occur in a valid stream, and `DBASE`/`DEXT` only
     /// have 30 entries so indexing past would panic.
     InvalidDistanceSymbol {
         sym: u16,
@@ -33,7 +33,7 @@ pub enum DecodeError {
         block_idx: u32,
     },
     /// Canonical Huffman code lengths sum to more than `2^max_bits` of
-    /// codeword space. Kraft-McMillan inequality fails — without this
+    /// codeword space. Kraft-McMillan inequality fails; without this
     /// check, later symbols silently overwrite LUT slots that already
     /// belonged to earlier symbols and the decoder emits the wrong byte.
     OverSubscribedHuffman {
@@ -51,7 +51,7 @@ pub enum DecodeError {
     },
     /// A code length exceeds the 15-bit DEFLATE limit. Out-of-range
     /// lengths would size the LUT past 64 KiB entries and break the
-    /// `u16` peek-width assumption in [`super::huffman::reverse_bits`].
+    /// `u16` peek-width assumption in `huffman`'s bit reversal.
     HuffmanCodeTooLong {
         max_bits: u8,
     },

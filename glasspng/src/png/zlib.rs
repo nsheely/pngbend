@@ -1,6 +1,8 @@
 //! zlib wrapping (RFC 1950) around a raw DEFLATE stream.
 
-/// Fatal errors from [`parse_zlib_stream`] — cases where the wrapper
+use super::chunks::Warning;
+
+/// Fatal errors from [`parse_zlib_stream`]: cases where the wrapper
 /// bytes won't slice cleanly into a deflate buffer. FCHECK and the
 /// trailing Adler-32 are checksums that surface as warnings instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +35,7 @@ pub struct ParsedZlib<'a> {
     pub header: [u8; 2],
     pub deflate_buf: &'a [u8],
     pub stored_adler: u32,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 /// Split an IDAT-concatenated zlib stream. Fails when the slice itself
@@ -45,6 +47,8 @@ pub fn parse_zlib_stream(idat: &[u8]) -> Result<ParsedZlib<'_>, ZlibError> {
     }
     let cmf = idat[0];
     let flg = idat[1];
+    // CM (low nibble) must be 8 (deflate); CINFO (high nibble) <= 7 caps the
+    // window at 32 KiB. Anything else is not a PNG zlib stream.
     if cmf & 0x0F != 8 || cmf >> 4 > 7 {
         return Err(ZlibError::BadCompressionMethod { cmf });
     }
@@ -53,7 +57,7 @@ pub fn parse_zlib_stream(idat: &[u8]) -> Result<ParsedZlib<'_>, ZlibError> {
     }
     let mut warnings = Vec::new();
     if (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0 {
-        warnings.push("stale checksum on PNG image-data header".to_string());
+        warnings.push(Warning::ZlibHeaderChecksum);
     }
     let deflate_buf = &idat[2..idat.len() - 4];
     let trailer = &idat[idat.len() - 4..];
@@ -66,27 +70,33 @@ pub fn parse_zlib_stream(idat: &[u8]) -> Result<ParsedZlib<'_>, ZlibError> {
     })
 }
 
+/// Default zlib header the encoder writes: CMF=0x78 (deflate, 32 KiB window),
+/// FLG=0x9c (default compression level, FDICT clear, FCHECK chosen so the two
+/// bytes are a multiple of 31). The re-emit path instead reuses a file's own
+/// header bytes, so this is only the fresh-encode default.
+pub const ZLIB_DEFAULT_HEADER: [u8; 2] = [0x78, 0x9c];
+
 /// Wrap `deflate_buf` in a zlib stream: 2-byte `header` prefix +
 /// `deflate_buf` + 4-byte Adler-32 trailer computed over `raw`. The
 /// caller passes the already-decoded raw bytes so saving doesn't have
 /// to re-inflate the stream just to compute the Adler-32.
-pub fn build_zlib_stream(deflate_buf: &[u8], header: &[u8], raw: &[u8]) -> Vec<u8> {
+pub fn build_zlib_stream(deflate_buf: &[u8], header: [u8; 2], raw: &[u8]) -> Vec<u8> {
     let adler = adler32(raw);
     let mut out = Vec::with_capacity(2 + deflate_buf.len() + 4);
-    out.extend_from_slice(&header[..2.min(header.len())]);
+    out.extend_from_slice(&header);
     out.extend_from_slice(deflate_buf);
     out.extend_from_slice(&adler.to_be_bytes());
     out
 }
 
-// ── Adler-32 (RFC 1950) ──────────────────────────────────────────────────────
+// Adler-32 (RFC 1950)
 
 pub fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
     let mut s1: u32 = 1;
     let mut s2: u32 = 0;
     // 5552 is the largest n such that 255*n*(n+1)/2 + (n+1)*(BASE-1) < 2^32
-    // (RFC 1950) — batching keeps the accumulators below u32 max.
+    // (RFC 1950); batching keeps the accumulators below u32 max.
     for chunk in data.chunks(5552) {
         for &b in chunk {
             s1 = s1.wrapping_add(b as u32);
@@ -111,7 +121,7 @@ mod tests {
 
     #[test]
     fn adler32_handles_long_input() {
-        // > 5552 bytes — exercise the batch boundary
+        // > 5552 bytes: exercise the batch boundary
         let data = vec![0xAAu8; 6000];
         let computed = adler32(&data);
         const MOD: u32 = 65521;
@@ -124,7 +134,7 @@ mod tests {
         assert_eq!(computed, (s2 << 16) | s1);
     }
 
-    /// Standard PNG zlib header — CM=8, CINFO=7, FLEVEL=2, no FDICT.
+    /// Standard PNG zlib header: CM=8, CINFO=7, FLEVEL=2, no FDICT.
     /// CMF=0x78, FLG=0x9C; (0x78*256 + 0x9C) % 31 == 0.
     fn build_idat(decoded: &[u8], deflate: &[u8]) -> Vec<u8> {
         let mut out = vec![0x78, 0x9C];
@@ -166,13 +176,13 @@ mod tests {
     #[test]
     fn parse_zlib_stream_surfaces_bad_fcheck_as_warning() {
         // CMF=0x78 valid, FLG=0x00 makes (0x78*256+0)%31 != 0. The
-        // stream should still parse — FCHECK is an integrity check on
+        // stream should still parse: FCHECK is an integrity check on
         // header bytes whose values are otherwise sane.
         let mut idat = vec![0x78, 0x00];
         idat.extend_from_slice(&[0u8; 8]);
         let parsed = parse_zlib_stream(&idat).expect("FCHECK is a warning, not an error");
         assert_eq!(parsed.warnings.len(), 1);
-        assert!(parsed.warnings[0].contains("stale"));
+        assert_eq!(parsed.warnings[0], Warning::ZlibHeaderChecksum);
     }
 
     #[test]

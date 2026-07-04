@@ -27,21 +27,14 @@ impl PngBendApp {
                 return;
             }
 
-            let (iw, ih, cw, ch_img, c_bpp, c_row_stride) = {
+            let (iw, ih, cw, ch_img, c_bpp) = {
                 let g = self
                     .doc
                     .core
                     .as_ref()
                     .expect("checked: texture implies core")
-                    .geom;
-                (
-                    g.w as f32,
-                    g.h as f32,
-                    g.w,
-                    g.h,
-                    g.bpp as usize,
-                    g.row_stride as usize,
-                )
+                    .info;
+                (g.width as f32, g.height as f32, g.width, g.height, g.bpp)
             };
             let tex = self.view.texture.as_ref().expect("checked above");
 
@@ -59,7 +52,7 @@ impl PngBendApp {
                 Color32::WHITE,
             );
 
-            // Selection markers — drawn on top of the texture so selection-only
+            // Selection markers, drawn on top of the texture so selection-only
             // changes never dirty the texture (no re-upload).
             self.draw_selection_markers(ui, img_rect, iw, ih);
 
@@ -69,12 +62,13 @@ impl PngBendApp {
             {
                 let px = pixel_at(pos, img_rect, iw, cw - 1);
                 let py = pixel_at_y(pos, img_rect, ih, ch_img - 1);
-                let base = py as usize * c_row_stride + 1 + px as usize * c_bpp;
                 let rgb: Vec<String> = self
                     .doc
                     .core
                     .as_ref()
                     .map(|c| {
+                        let base =
+                            c.raster.xy_to_out(crate::coords::PixelXY::new(px, py)).0 as usize;
                         (0..c_bpp.min(3))
                             .filter_map(|i| c.output.get(base + i).map(|v| v.to_string()))
                             .collect()
@@ -90,19 +84,21 @@ impl PngBendApp {
             {
                 let px = pixel_at(pos, img_rect, iw, cw - 1);
                 let py = pixel_at_y(pos, img_rect, ih, ch_img - 1);
-                self.select_pixel(px, py, SelectSource::ImageClick);
+                self.select_pixel(
+                    crate::coords::PixelXY::new(px, py),
+                    SelectSource::ImageClick,
+                );
                 self.view.texture_dirty = true;
             }
 
-            // Window title — "• filename — PNGbend" with the bullet
-            // marking unsaved changes. Only send a viewport command
-            // when the title actually changes; egui has no "did this
-            // change?" check internally, so resending every frame
-            // would spam the windowing layer with no-ops.
+            // Title is the filename plus "PNGbend", with a leading bullet
+            // marking unsaved changes. Only send a viewport command when
+            // the title changes; egui doesn't dedupe, so resending every
+            // frame would spam the windowing layer with no-ops.
             let title = if let Some(ref p) = self.doc.path {
                 let name = p.file_name().unwrap_or_default().to_string_lossy();
                 let dirty = if self.doc.dirty { "• " } else { "" };
-                format!("{dirty}{name} — PNGbend")
+                format!("{dirty}{name} - PNGbend")
             } else {
                 "PNGbend".to_string()
             };
@@ -123,7 +119,7 @@ impl PngBendApp {
         let Some(c) = self.doc.core.as_ref() else {
             return;
         };
-        let dims = [c.geom.w as usize, c.geom.h as usize];
+        let dims = [c.info.width as usize, c.info.height as usize];
         if self.view.base_rgba.len() != dims[0] * dims[1] * 4 {
             return;
         }
@@ -141,10 +137,10 @@ impl PngBendApp {
 
     /// If the current overlay mode has bytes to composite, blend them into
     /// `composite_scratch` and return `true`. Otherwise leave the scratch
-    /// alone and return `false` — the caller uploads `base_rgba` directly.
+    /// alone and return `false`; the caller uploads `base_rgba` directly.
     ///
     /// When `partial_composite_rows` is set (by the incremental edit
-    /// path), refresh just those rows inside `composite_scratch` — the
+    /// path), refresh just those rows inside `composite_scratch`; the
     /// other rows still hold last frame's valid composite.
     fn compose_into_scratch(&mut self) -> bool {
         // Split-borrow: ViewState fields are disjoint from `doc.core`, and
@@ -152,9 +148,8 @@ impl PngBendApp {
         // with a `&mut composite_scratch` write target.
         let view = &mut self.view;
         let overlay: Option<&Vec<u8>> = match view.overlay_mode {
-            OverlayMode::None => None,
             OverlayMode::Cascade => view.cascade_rgba.as_ref(),
-            other => view.overlay_cache.get(other),
+            m => m.event_overlay().and_then(|e| view.overlay_cache.get(e)),
         };
         let Some(ov) = overlay else {
             view.partial_composite_rows.take();
@@ -169,7 +164,7 @@ impl PngBendApp {
                 &view.base_rgba,
                 ov,
                 &mut view.composite_scratch,
-                c.geom.w,
+                c.info.width,
                 rows,
             );
             return true;
@@ -186,7 +181,7 @@ impl PngBendApp {
         image_w: f32,
         image_h: f32,
     ) {
-        let Some((sx, sy)) = self.sel.sel_pixel else {
+        let Some(sel) = self.sel.sel_pixel else {
             return;
         };
         let painter = ui.painter_at(img_rect);
@@ -196,11 +191,11 @@ impl PngBendApp {
                 img_rect.top() + (py as f32 + 0.5) / image_h * img_rect.height(),
             )
         };
-        let center = px_to_screen(sx, sy);
+        let center = px_to_screen(sel.x, sel.y);
 
         // Back-reference source: red line + circle at the src pixel.
-        if let Some((bx, by)) = self.sel.backref_src {
-            let src = px_to_screen(bx, by);
+        if let Some(src_xy) = self.sel.backref_src {
+            let src = px_to_screen(src_xy.x, src_xy.y);
             let red = Color32::from_rgba_unmultiplied(255, 80, 80, 220);
             painter.line_segment([center, src], egui::Stroke::new(1.5, red));
             painter.circle_stroke(

@@ -32,7 +32,7 @@ struct LutEntry {
 /// Validates the Kraft-McMillan inequality before building: an
 /// over-subscribed length set silently corrupts the LUT (later symbols
 /// overwrite slots assigned to earlier ones), and an under-subscribed
-/// set leaves valid peek patterns with no symbol — both fail loudly here
+/// set leaves valid peek patterns with no symbol; both fail loudly here
 /// instead. The single-symbol/single-bit degenerate code allowed by
 /// RFC 1951 §3.2.2 (used when only one distance is referenced) is the
 /// one exception.
@@ -123,7 +123,7 @@ pub(super) fn build_tree(lengths: &[u32]) -> Result<(HuffmanTable, EncTable), De
         // the low `clen` bits of `c` to match the peek value we'll see.
         let rev = reverse_bits(c, clen);
 
-        // Fill every LUT slot whose low `clen` bits match `rev` — those are
+        // Fill every LUT slot whose low `clen` bits match `rev`: those are
         // the peek values starting with this code.
         let step = 1usize << clen;
         let mut idx = rev as usize;
@@ -174,6 +174,107 @@ pub(super) fn decode_sym(reader: &mut BitReader, table: &HuffmanTable) -> Result
     Ok(entry.sym)
 }
 
+// Encoder side: optimal length-limited code lengths from symbol
+// frequencies, the complement of `build_tree`'s lengths -> codes.
+
+#[derive(Clone, Copy)]
+enum PmKind {
+    Leaf(u32),
+    Pkg(u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct PmNode {
+    w: u64,
+    k: PmKind,
+}
+
+/// Add each leaf under the selected package to its code length.
+fn pm_count(levels: &[Vec<PmNode>], level: usize, idx: usize, lengths: &mut [u8]) {
+    match levels[level][idx].k {
+        PmKind::Leaf(s) => lengths[s as usize] += 1,
+        PmKind::Pkg(a, b) => {
+            pm_count(levels, level - 1, a as usize, lengths);
+            pm_count(levels, level - 1, b as usize, lengths);
+        }
+    }
+}
+
+/// Length-limited Huffman code lengths for `weights` (0 for absent symbols),
+/// none longer than `max_bits`, via the package-merge algorithm (optimal,
+/// unlike build-a-tree-then-clamp).
+pub(super) fn package_merge(weights: &[u32], max_bits: u8) -> Vec<u8> {
+    let mut lengths = vec![0u8; weights.len()];
+    let mut leaves: Vec<PmNode> = weights
+        .iter()
+        .enumerate()
+        .filter(|&(_, &w)| w > 0)
+        .map(|(i, &w)| PmNode {
+            w: w as u64,
+            k: PmKind::Leaf(i as u32),
+        })
+        .collect();
+    let n = leaves.len();
+    if n == 0 {
+        return lengths;
+    }
+    if n == 1 {
+        if let PmKind::Leaf(s) = leaves[0].k {
+            lengths[s as usize] = 1; // degenerate single 1-bit code
+        }
+        return lengths;
+    }
+    leaves.sort_by_key(|node| node.w);
+
+    // levels[k] is the merged list after k package+merge passes; a package
+    // records the two child indices in the previous level.
+    let mut levels: Vec<Vec<PmNode>> = Vec::with_capacity(max_bits as usize);
+    levels.push(leaves.clone());
+    for _ in 1..max_bits {
+        let mut merged = leaves.clone();
+        {
+            let prev = levels.last().unwrap();
+            let mut m = 0;
+            while m + 1 < prev.len() {
+                merged.push(PmNode {
+                    w: prev[m].w + prev[m + 1].w,
+                    k: PmKind::Pkg(m as u32, (m + 1) as u32),
+                });
+                m += 2;
+            }
+        }
+        merged.sort_by_key(|node| node.w);
+        levels.push(merged);
+    }
+
+    let last = levels.len() - 1;
+    let select = (2 * n - 2).min(levels[last].len());
+    for i in 0..select {
+        pm_count(&levels, last, i, &mut lengths);
+    }
+    lengths
+}
+
+/// Canonical encoder table for a set of code lengths, via `build_tree`'s
+/// canonical-code assignment.
+pub(super) fn enc_from_lengths(lengths: &[u8]) -> EncTable {
+    let l32: Vec<u32> = lengths.iter().map(|&l| l as u32).collect();
+    build_tree(&l32)
+        .expect("generated Huffman lengths are valid")
+        .1
+}
+
+/// The fixed literal/distance code lengths (RFC 1951 §3.2.6), shared by the
+/// BTYPE=01 decoder and the fixed-Huffman serializer so the two can't drift.
+pub(super) fn fixed_code_lengths() -> (Vec<u32>, Vec<u32>) {
+    let mut ll = vec![0u32; 288];
+    ll[..144].fill(8);
+    ll[144..256].fill(9);
+    ll[256..280].fill(7);
+    ll[280..288].fill(8);
+    (ll, vec![5u32; 32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,13 +297,13 @@ mod tests {
         let lengths = [3u32, 3, 3, 3, 3, 2, 4, 4];
         let (tab, enc) = build_tree(&lengths).expect("valid canonical set");
         for (sym, &len) in lengths.iter().enumerate() {
-            let (code, clen) = enc.get(sym as u16).expect("sym in enc");
-            assert_eq!(clen as u32, len);
+            let sc = enc.get(sym as u16).expect("sym in enc");
+            assert_eq!(sc.len as u32, len);
             let mut buf = vec![0u8; 4];
-            write_bits(&mut buf, 0, code as u32, clen);
+            write_bits(&mut buf, 0, sc.code as u32, sc.len);
             let mut reader = BitReader::new(&buf);
             assert_eq!(decode_sym(&mut reader, &tab).unwrap(), sym as u16);
-            assert_eq!(reader.bit_pos(), clen as usize);
+            assert_eq!(reader.bit_pos(), sc.len as usize);
         }
     }
 
@@ -242,7 +343,7 @@ mod tests {
 
     #[test]
     fn rejects_oversubscribed_lengths() {
-        // Three symbols at length 1 — only two 1-bit codewords exist, so
+        // Three symbols at length 1: only two 1-bit codewords exist, so
         // the third would silently overwrite slot 0 if the build wasn't
         // guarded.
         let err = build_tree(&[1, 1, 1]).unwrap_err();
@@ -261,7 +362,7 @@ mod tests {
 
     #[test]
     fn rejects_undersubscribed_lengths() {
-        // Two symbols at length 2 — fills two of four slots but leaves
+        // Two symbols at length 2: fills two of four slots but leaves
         // two valid peek patterns with no symbol. RFC 1951's leniency
         // covers only the one-symbol/one-bit case.
         let err = build_tree(&[2, 2]).unwrap_err();
@@ -298,5 +399,22 @@ mod tests {
             matches!(err, DecodeError::HuffmanCodeTooLong { max_bits: 16 }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn package_merge_produces_bounded_complete_codes() {
+        // Skewed frequencies; lengths must respect the limit and form a
+        // complete code (Kraft sum == 1).
+        let weights = [100u32, 1, 1, 1, 1, 50, 3, 20, 20, 20];
+        let lengths = package_merge(&weights, 15);
+        assert!(lengths.iter().all(|&l| l <= 15));
+        let kraft: f64 = lengths
+            .iter()
+            .filter(|&&l| l > 0)
+            .map(|&l| 2f64.powi(-(l as i32)))
+            .sum();
+        assert!((kraft - 1.0).abs() < 1e-9, "kraft {kraft}");
+        // The most frequent symbol gets the shortest code.
+        assert!(lengths[0] <= *lengths.iter().filter(|&&l| l > 0).max().unwrap());
     }
 }

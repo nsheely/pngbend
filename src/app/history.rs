@@ -2,7 +2,7 @@
 //!
 //! Encapsulates the two stacks of inverse-[`EditAction`]s so the
 //! "recording a new edit clears redo" invariant lives inside
-//! [`UndoHistory::record`] — can't be forgotten by callers.
+//! [`UndoHistory::record`] and can't be forgotten by callers.
 
 use super::edit::EditAction;
 

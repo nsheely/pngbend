@@ -58,7 +58,7 @@ impl std::fmt::Display for ConvertError {
 
 impl std::error::Error for ConvertError {}
 
-/// Palette entry — RGBA, with alpha defaulting to 255 when no tRNS is present.
+/// Palette entry: RGBA, with alpha defaulting to 255 when no tRNS is present.
 pub type PaletteEntry = [u8; 4];
 
 /// Verify `unfiltered` has the full `h * (row_stride - 1)` bytes the
@@ -104,7 +104,7 @@ pub fn to_rgba8(
     Ok(rgba)
 }
 
-/// Convert `rows` (in whatever order — typically sorted) from the unfiltered
+/// Convert `rows` (in whatever order, typically sorted) from the unfiltered
 /// buffer into their RGBA slots in `rgba`. Used by the incremental edit
 /// path: a literal swap touches a handful of rows, not the whole image.
 pub fn to_rgba8_rows_into(
@@ -123,7 +123,7 @@ pub fn to_rgba8_rows_into(
 }
 
 /// Convert one row worth of unfiltered pixels into four-byte RGBA. Bounds
-/// are assumed valid — callers use the full-image wrappers above which
+/// are assumed valid; callers use the full-image wrappers above which
 /// check them. `w` is the image width in pixels (passed in so the caller
 /// saves a field load per row on hot paths).
 fn to_rgba8_row_unchecked(
@@ -302,8 +302,8 @@ fn write_rgba(dst: &mut [u8], d: usize, r: u8, g: u8, b: u8, a: u8) {
     dst[d..d + 4].copy_from_slice(&[r, g, b, a]);
 }
 
-/// Write a greyscale pixel — replicate the luma to R/G/B and store
-/// alpha — as one 4-byte slot.
+/// Write a greyscale pixel (replicate the luma to R/G/B and store
+/// alpha) as one 4-byte slot.
 #[inline(always)]
 fn write_grey(dst: &mut [u8], d: usize, luma: u8, alpha: u8) {
     write_rgba(dst, d, luma, luma, luma, alpha);
@@ -328,23 +328,204 @@ pub fn decode_palette(plte: &[u8], trns: Option<&[u8]>) -> Vec<PaletteEntry> {
     pal
 }
 
+/// A tRNS colour key: pixels whose samples equal this value decode to
+/// transparent (PNG spec §11.3.2, colour types Greyscale and RGB only).
+/// Indexed transparency is folded into the palette by [`decode_palette`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrnsKey {
+    Grey(u16),
+    Rgb(u16, u16, u16),
+}
+
+impl TrnsKey {
+    /// The key as an 8-bit RGB triple in the space [`to_rgba8`] produces,
+    /// so a matching pixel is found by RGB comparison. Sub-byte greyscale
+    /// scales by the spec's `255 / (2^bd - 1)` rule; 16-bit takes the high
+    /// byte, matching the decoder's downsample.
+    fn to_rgb8(self, bit_depth: u8) -> [u8; 3] {
+        let scale = |s: u16| -> u8 {
+            match bit_depth {
+                16 => (s >> 8) as u8,
+                8 => s as u8,
+                4 => (s * 17) as u8,
+                2 => (s * 85) as u8,
+                _ => (s * 255) as u8,
+            }
+        };
+        match self {
+            Self::Grey(g) => {
+                let v = scale(g);
+                [v, v, v]
+            }
+            Self::Rgb(r, g, b) => [scale(r), scale(g), scale(b)],
+        }
+    }
+}
+
+/// Set alpha to 0 on every pixel whose RGB equals the tRNS colour `key`.
+/// Call after [`to_rgba8`] for Greyscale / RGB images that carry a tRNS
+/// chunk. Exact for 1/2/4/8-bit; approximate for 16-bit (matches the
+/// high-byte decode).
+pub fn apply_color_key(rgba: &mut [u8], info: &PngInfo, key: TrnsKey) {
+    let target = key.to_rgb8(info.bit_depth);
+    for px in rgba.chunks_exact_mut(4) {
+        if px[..3] == target {
+            px[3] = 0;
+        }
+    }
+}
+
+/// Pack RGBA8 pixels back into the raw (unfiltered) byte layout for
+/// `info`'s colour type, the inverse of [`to_rgba8`]. Supports the byte-
+/// aligned non-indexed types (Grey/RGB/GreyAlpha/RGBA at 8 and 16 bit);
+/// RGBA8 is a straight copy. Indexed and sub-byte depths return
+/// [`ConvertError::UnsupportedDepth`] (they need a palette or quantisation
+/// the caller must supply). 16-bit packing writes each 8-bit sample as
+/// `[v, v]`, so it round-trips the high-byte decode losslessly.
+///
+/// Grey targets take the R channel and RGB targets drop alpha, so the
+/// input must be consistent with the target (`R == G == B` for grey,
+/// `A == 255` for the alpha-less types) to be lossless.
+pub fn pack(rgba: &[u8], info: &PngInfo) -> Result<Vec<u8>, ConvertError> {
+    let w = info.width as usize;
+    let h = info.height as usize;
+    let expected = w * h * 4;
+    if rgba.len() < expected {
+        return Err(ConvertError::TruncatedInput {
+            expected,
+            actual: rgba.len(),
+        });
+    }
+    let row_bytes = info.row_stride - 1;
+    let mut out = vec![0u8; h * row_bytes];
+    for y in 0..h {
+        let px = &rgba[y * w * 4..y * w * 4 + w * 4];
+        let row = &mut out[y * row_bytes..y * row_bytes + row_bytes];
+        pack_row(px, info, row, w)?;
+    }
+    Ok(out)
+}
+
+fn pack_row(px: &[u8], info: &PngInfo, row: &mut [u8], w: usize) -> Result<(), ConvertError> {
+    match (info.color_type, info.bit_depth) {
+        (ColorType::Rgba, 8) => row.copy_from_slice(px),
+        (ColorType::Rgb, 8) => {
+            for i in 0..w {
+                row[i * 3..i * 3 + 3].copy_from_slice(&px[i * 4..i * 4 + 3]);
+            }
+        }
+        (ColorType::Greyscale, 8) => {
+            for i in 0..w {
+                row[i] = px[i * 4];
+            }
+        }
+        (ColorType::GreyAlpha, 8) => {
+            for i in 0..w {
+                row[i * 2] = px[i * 4];
+                row[i * 2 + 1] = px[i * 4 + 3];
+            }
+        }
+        (ColorType::Rgba, 16) => {
+            for i in 0..w {
+                for c in 0..4 {
+                    let v = px[i * 4 + c];
+                    row[i * 8 + c * 2] = v;
+                    row[i * 8 + c * 2 + 1] = v;
+                }
+            }
+        }
+        (ColorType::Rgb, 16) => {
+            for i in 0..w {
+                for c in 0..3 {
+                    let v = px[i * 4 + c];
+                    row[i * 6 + c * 2] = v;
+                    row[i * 6 + c * 2 + 1] = v;
+                }
+            }
+        }
+        (ColorType::Greyscale, 16) => {
+            for i in 0..w {
+                let v = px[i * 4];
+                row[i * 2] = v;
+                row[i * 2 + 1] = v;
+            }
+        }
+        (ColorType::GreyAlpha, 16) => {
+            for i in 0..w {
+                let (v, a) = (px[i * 4], px[i * 4 + 3]);
+                row[i * 4] = v;
+                row[i * 4 + 1] = v;
+                row[i * 4 + 2] = a;
+                row[i * 4 + 3] = a;
+            }
+        }
+        (ct, bd) => {
+            return Err(ConvertError::UnsupportedDepth {
+                color_type: ct,
+                bit_depth: bd,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn info(w: u32, h: u32, color: ColorType, bit_depth: u8) -> PngInfo {
-        let channels = color.channels() as usize;
-        let bits_per_pixel = channels * bit_depth as usize;
-        let bpp = bits_per_pixel.div_ceil(8).max(1);
-        let row_data_bytes = (w as usize * bits_per_pixel).div_ceil(8);
-        PngInfo {
-            width: w,
-            height: h,
-            bit_depth,
-            color_type: color,
-            bpp,
-            row_stride: 1 + row_data_bytes,
+        PngInfo::new(w, h, bit_depth, color)
+    }
+
+    /// `to_rgba8(pack(rgba)) == rgba` for every byte-aligned non-indexed
+    /// type, given an input consistent with the target (grey has R==G==B,
+    /// alpha-less types have A==255).
+    #[test]
+    fn pack_then_decode_round_trips() {
+        for (color, depth) in [
+            (ColorType::Rgba, 8),
+            (ColorType::Rgb, 8),
+            (ColorType::Greyscale, 8),
+            (ColorType::GreyAlpha, 8),
+            (ColorType::Rgba, 16),
+            (ColorType::Rgb, 16),
+            (ColorType::Greyscale, 16),
+            (ColorType::GreyAlpha, 16),
+        ] {
+            let (w, h) = (4usize, 3usize);
+            let g = info(w as u32, h as u32, color, depth);
+            let has_alpha = matches!(color, ColorType::Rgba | ColorType::GreyAlpha);
+            let is_grey = matches!(color, ColorType::Greyscale | ColorType::GreyAlpha);
+            let rgba: Vec<u8> = (0..w * h)
+                .flat_map(|i| {
+                    let v = (i * 9 + 1) as u8;
+                    let (r, gc, b) = if is_grey {
+                        (v, v, v)
+                    } else {
+                        (v, v ^ 0x5A, v ^ 0x33)
+                    };
+                    let a = if has_alpha { (i * 4 + 2) as u8 } else { 255 };
+                    [r, gc, b, a]
+                })
+                .collect();
+            let raw = pack(&rgba, &g).unwrap();
+            assert_eq!(raw.len(), h * (g.row_stride - 1));
+            let back = to_rgba8(&raw, &g, None).unwrap();
+            assert_eq!(back, rgba, "{color:?} {depth}-bit");
         }
+    }
+
+    #[test]
+    fn pack_rejects_indexed_and_subbyte() {
+        let rgba = vec![0u8; 4 * 4];
+        assert!(matches!(
+            pack(&rgba, &info(2, 2, ColorType::Indexed, 8)),
+            Err(ConvertError::UnsupportedDepth { .. })
+        ));
+        assert!(matches!(
+            pack(&rgba, &info(2, 2, ColorType::Greyscale, 4)),
+            Err(ConvertError::UnsupportedDepth { .. })
+        ));
     }
 
     #[test]

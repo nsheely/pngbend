@@ -43,7 +43,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   build:
     name: Build
@@ -90,13 +90,23 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build all targets (debug)
-        run: cargo build --all-targets --verbose
+        run: cargo build --workspace --all-targets --verbose
+
+      # The differential conformance corpus isn't vendored; fetch it so the
+      # pngsuite test runs instead of skipping. Linux only: the test is
+      # platform-independent and skips cleanly where the corpus is absent.
+      # Non-fatal: a flaky upstream host must not red the build; the test
+      # skips if the corpus didn't download.
+      - name: Fetch PngSuite corpus
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: bash scripts/fetch-pngsuite.sh
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
       - name: Compile benchmarks
-        run: cargo bench --no-run --verbose
+        run: cargo bench --workspace --no-run --verbose
 
       - name: Build (release)
         run: cargo build --release --verbose

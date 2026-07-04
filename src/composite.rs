@@ -1,20 +1,21 @@
-//! Alpha compositor — the final step of the texture-rebuild pipeline,
+//! Alpha compositor: the final step of the texture-rebuild pipeline,
 //! consuming a base RGBA buffer and an overlay RGBA buffer.
 //!
 //! Integer math end-to-end. The hot loop blends four RGBA pixels per
-//! iteration via `wide::u32x4` (16-byte SIMD on every target). Wider
-//! lane widths (`u32x8`) only help on AVX2 builds and regress on the
-//! portable build by ~10 %; the choice here keeps the binary portable
-//! and lets LLVM widen on AVX2-capable hardware automatically.
+//! iteration via `wide::u32x4` (16-byte SIMD on every target). Wider lanes
+//! (`u32x8`) only help on AVX2 builds and regress the portable build by
+//! ~10 %; `u32x4` keeps the binary portable and lets LLVM widen on AVX2
+//! hardware automatically.
 //!
-//! All blending assumes the *base* is fully opaque (`ba == 255`). That
-//! invariant holds for every output of [`crate::png::to_rgba8`] — RGB,
-//! greyscale, and indexed without tRNS — which is the only buffer the
-//! GUI ever passes here. Under it the source-over formula collapses to
-//! `out_rgb = (fo*oa + fb*(255 - oa)) / 255`, with no per-pixel
-//! divide. RGBA / greyscale-alpha / palette+tRNS sources don't satisfy
-//! the invariant; output is still well-defined (`out_a = 255`) and
-//! sufficient for overlay visualisation.
+//! All blending assumes the *base* is fully opaque (`ba == 255`). That holds
+//! for every output of [`crate::png::to_rgba8`] and its interlaced counterpart
+//! [`crate::png::deinterlace_to_rgba8`] (RGB, greyscale, and indexed without
+//! tRNS), the buffers the GUI passes here. Under it the
+//! source-over formula collapses to
+//! `out_rgb = (fo*oa + fb*(255 - oa)) / 255`, with no per-pixel divide.
+//! RGBA / greyscale-alpha / palette+tRNS sources don't satisfy it; output
+//! is still well-defined (`out_a = 255`) and fine for overlay
+//! visualisation.
 
 use wide::u32x4;
 
@@ -33,9 +34,8 @@ pub fn composite_into(base: &[u8], overlay: &[u8], out: &mut Vec<u8>) {
     composite_ba255_simd(base, overlay, out);
 }
 
-/// Allocating wrapper around [`composite_into`]. The GUI's frame loop
-/// uses [`composite_into`] with a reusable scratch; this form is for
-/// tests and benches that don't have one.
+/// Allocating wrapper around [`composite_into`], for tests and benches
+/// without the reusable scratch the GUI's frame loop uses.
 pub fn composite_rgba(base: &[u8], overlay: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(base.len());
     composite_into(base, overlay, &mut out);
@@ -103,7 +103,7 @@ fn composite_ba255_simd(base: &[u8], overlay: &[u8], out: &mut [u8]) {
 
         // Source-over assuming ba=255:
         //   out_rgb = (fo*oa + fb*(255 - oa)) / 255
-        // Replace /255 with the exact integer form
+        // Exact integer form of the /255 divide:
         //   (x + 1 + (x >> 8)) >> 8
         // which is bit-exact for x ∈ [0, 65025]. Max sum is 65025
         // (since oa and inv_oa sum to 255). Three u32 ops per channel;
@@ -177,7 +177,7 @@ mod tests {
     }
 
     /// Scalar reference implementation. The SIMD body must agree with
-    /// this byte-for-byte under the `ba == 255` invariant — that's what
+    /// this byte-for-byte under the `ba == 255` invariant; that's what
     /// the round-trip tests below check.
     fn reference_ba255(base: &[u8], overlay: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; base.len()];
@@ -194,10 +194,10 @@ mod tests {
             200, 220, 240, 255, // pixel 3
         ];
         let overlay = vec![
-            255, 0, 0, 128, // pixel 0 — red at 50% alpha
-            0, 255, 0, 64, // pixel 1 — green at ~25%
-            0, 0, 255, 200, // pixel 2 — blue at ~78%
-            128, 128, 128, 0, // pixel 3 — transparent overlay
+            255, 0, 0, 128, // pixel 0: red at 50% alpha
+            0, 255, 0, 64, // pixel 1: green at ~25%
+            0, 0, 255, 200, // pixel 2: blue at ~78%
+            128, 128, 128, 0, // pixel 3: transparent overlay
         ];
         let mut simd_out = Vec::new();
         composite_into(&base, &overlay, &mut simd_out);

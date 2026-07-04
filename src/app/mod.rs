@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
+use crate::coords::PixelXY;
 use crate::index::CascadeScratch;
 
 mod edit;
@@ -13,7 +14,6 @@ mod row_text;
 mod select;
 mod ui;
 
-use edit::EditAction;
 use history::UndoHistory;
 use io::{CoreData, DialogResult, LoadedFile};
 use list_filter::{FilterRef, FilterSpec, filter_all, filter_lit, filter_refs};
@@ -28,7 +28,7 @@ pub(super) enum PixelType {
     All,
 }
 
-/// Persistent file-document state — the bytes on disk and how to round-trip
+/// Persistent file-document state: the bytes on disk and how to round-trip
 /// them. `core` is the materialised view of `deflate_buf`; `history` is the
 /// undo stack, kept here because each entry encodes a delta on `deflate_buf`.
 #[derive(Default)]
@@ -60,13 +60,21 @@ pub(in crate::app) struct ViewState {
     pub(in crate::app) cascade_scratch: CascadeScratch,
     /// Rows that changed on the last apply / undo. When `Some`, the next
     /// texture rebuild blends only these rows in `composite_scratch`;
-    /// every other row already holds the last frame's composite, which
-    /// is still valid because nothing else moved. Consumed (via
-    /// `Option::take`) by `compose_into_scratch`.
+    /// every other row already holds the last frame's composite, still
+    /// valid because nothing else moved. Consumed by `compose_into_scratch`.
     pub(in crate::app) partial_composite_rows: Option<Vec<usize>>,
 }
 
-/// Left-panel pixel-list state — what the user is filtering, what the
+/// The predicate a `rebuild_filter` ran, kept so the next call can detect a
+/// refinement and re-test only the current view. The three parts describe one
+/// rebuild, so they travel as a unit — present together or absent together.
+struct FilterSnapshot {
+    spec: FilterSpec,
+    editable_only: bool,
+    pixel_type: PixelType,
+}
+
+/// Left-panel pixel-list state: what the user is filtering, what the
 /// virtual scroll is showing, and the snapshot needed to detect filter
 /// refinements between keystrokes.
 #[derive(Default)]
@@ -75,7 +83,7 @@ pub(in crate::app) struct ListState {
     pub(in crate::app) filter_text: String,
     pub(in crate::app) editable_only: bool,
     /// Indices into the source [`PixelIndex`] for every row that passes
-    /// the filter. `FilterRef` is 8 bytes — far cheaper to copy than
+    /// the filter. `FilterRef` is 8 bytes, far cheaper to copy than
     /// the underlying [`PixelRow`] on a multi-megapixel keystroke
     /// rebuild.
     pub(in crate::app) filtered_view: Vec<FilterRef>,
@@ -88,11 +96,9 @@ pub(in crate::app) struct ListState {
     /// Snapshot of the previous `rebuild_filter` predicate. When the
     /// next call is a refinement (user typed another character, flipped
     /// `editable_only` on, etc.) the rebuild re-tests only the rows in
-    /// `filtered_view` rather than rescanning the full `PixelIndex` —
+    /// `filtered_view` rather than rescanning the full `PixelIndex`:
     /// `O(previous_view.len())` instead of `O(pixel_count)`.
-    pub(in crate::app) last_filter_spec: Option<FilterSpec>,
-    pub(in crate::app) last_filter_editable_only: bool,
-    pub(in crate::app) last_filter_pixel_type: Option<PixelType>,
+    pub(in crate::app) last_filter: Option<FilterSnapshot>,
     pub(in crate::app) list_scroll_to: Option<usize>,
     pub(in crate::app) list_viewport_rows: usize,
 }
@@ -100,12 +106,11 @@ pub(in crate::app) struct ListState {
 /// The currently selected pixel and the edit options derived from it.
 #[derive(Default)]
 pub(in crate::app) struct Selection {
-    pub(in crate::app) sel_pixel: Option<(u32, u32)>,
-    pub(in crate::app) backref_src: Option<(u32, u32)>,
+    pub(in crate::app) sel_pixel: Option<PixelXY>,
+    pub(in crate::app) backref_src: Option<PixelXY>,
     pub(in crate::app) info_text: String,
     pub(in crate::app) edit_options: Vec<EditOption>,
     pub(in crate::app) selected_edit: Option<usize>,
-    pub(in crate::app) pending_edit: Option<EditAction>,
 }
 
 /// Background-thread channels for the file load and the file dialog.
@@ -131,14 +136,14 @@ pub struct PngBendApp {
     pub(in crate::app) sel: Selection,
     pub(in crate::app) async_ops: AsyncOps,
 
-    // Whole-app UI ephemera (shown directly in widgets — no obvious group).
+    // Whole-app UI ephemera (shown directly in widgets, no obvious group).
     pub(in crate::app) status: String,
     pub(in crate::app) hover_info: String,
     /// Last window-title string we asked egui to set. Caching prevents
     /// rebuilding + sending a `ViewportCommand::Title` every frame when
     /// nothing about the title (path, dirty state) has changed.
     pub(in crate::app) last_title: String,
-    /// Whether the Help → About modal is currently open.
+    /// Whether the Help → About modal is open.
     pub(in crate::app) show_about: bool,
 }
 
@@ -168,28 +173,26 @@ impl PngBendApp {
         app
     }
 
-    /// Clear transient per-file state — selection, edits, undo history,
+    /// Clear transient per-file state: selection, edits, undo history,
     /// cached overlays, and the left-panel filtered view. Shared between
     /// `open_path` (starting a load) and `on_load_done` (finishing one) so
     /// neither site has to remember the full list.
     pub(super) fn reset_for_new_file(&mut self) {
         self.sel.sel_pixel = None;
         self.sel.backref_src = None;
-        self.sel.pending_edit = None;
         self.sel.selected_edit = None;
         self.sel.edit_options.clear();
         self.doc.history.clear();
         self.view.overlay_cache.clear();
         self.view.cascade_rgba = None;
         self.doc.dirty = false;
-        // Left-panel state — otherwise the previous file's rows keep
+        // Left-panel state. Otherwise the previous file's rows keep
         // showing until the new file's rebuild_filter runs, and a stale
         // list_scroll_to from the prior selection can auto-scroll the new
         // file's list to an arbitrary row.
         self.list.filtered_view.clear();
         self.list.filtered_idx.clear();
-        self.list.last_filter_spec = None;
-        self.list.last_filter_pixel_type = None;
+        self.list.last_filter = None;
         self.list.list_scroll_to = None;
     }
 
@@ -203,7 +206,7 @@ impl PngBendApp {
 
     /// `(FilterRef, PixelRow)` for the visible-list index. The row is
     /// returned by value (it's `Copy`) so callers can release the borrow
-    /// on `self.doc.core` before touching `&mut self` — e.g. to fire a
+    /// on `self.doc.core` before touching `&mut self`, e.g. to fire a
     /// click handler that calls `select_pixel`.
     pub(in crate::app) fn filtered_row_full(
         &self,
@@ -214,24 +217,23 @@ impl PngBendApp {
         Some((f, *f.resolve(pi)))
     }
 
-    /// Resolve a visible-list index to its `(x, y)` — the most common
-    /// thing callers want from a filtered row.
-    pub(super) fn filtered_xy(&self, i: usize) -> Option<(u32, u32)> {
+    /// Resolve a visible-list index to its pixel coordinate.
+    pub(super) fn filtered_xy(&self, i: usize) -> Option<PixelXY> {
         Some(self.filtered_row(i)?.xy())
     }
 
     /// `Some(i)` if pixel `xy` is in the current filtered view at index `i`.
     #[inline]
-    pub(super) fn filtered_pos(&self, xy: (u32, u32)) -> Option<usize> {
+    pub(super) fn filtered_pos(&self, xy: PixelXY) -> Option<usize> {
         let c = self.doc.core.as_ref()?;
-        let w = c.geom.w as usize;
-        let idx = xy.1 as usize * w + xy.0 as usize;
+        let w = c.info.width as usize;
+        let idx = xy.y as usize * w + xy.x as usize;
         let slot = self.list.filtered_idx.get(idx).copied()?;
         (slot != u32::MAX).then_some(slot as usize)
     }
 
     #[inline]
-    pub(super) fn is_in_filtered(&self, xy: (u32, u32)) -> bool {
+    pub(super) fn is_in_filtered(&self, xy: PixelXY) -> bool {
         self.filtered_pos(xy).is_some()
     }
 
@@ -239,13 +241,12 @@ impl PngBendApp {
         let Some(c) = self.doc.core.as_ref() else {
             self.list.filtered_view.clear();
             self.list.filtered_idx.clear();
-            self.list.last_filter_spec = None;
-            self.list.last_filter_pixel_type = None;
+            self.list.last_filter = None;
             return;
         };
         let pi = &c.pixel_index;
-        let w = c.geom.w as usize;
-        let pc = w * c.geom.h as usize;
+        let w = c.info.width as usize;
+        let pc = w * c.info.height as usize;
 
         // Parse once. Structured shapes (#hex, d=N, x,y) are O(1) per row;
         // only the `Generic` fallback formats each row.
@@ -255,18 +256,16 @@ impl PngBendApp {
 
         // Narrowing path: can we re-test *just* the current `filtered_view`
         // rather than rescanning the full `PixelIndex`? Two conditions:
-        // (1) `pixel_type` didn't change — otherwise we're filtering a
-        //     different source array and the indices would be wrong;
-        // (2) the predicate only got stricter — same or tighter `editable_only`
+        // (1) `pixel_type` didn't change (otherwise we're filtering a
+        //     different source array and the indices would be wrong);
+        // (2) the predicate only got stricter: same or tighter `editable_only`
         //     AND the new spec is a refinement of the previous.
         // When either fails we fall through to the full scan.
-        let can_narrow = self.list.last_filter_pixel_type == Some(new_pixel_type)
-            && (!self.list.last_filter_editable_only || new_editable)
-            && self
-                .list
-                .last_filter_spec
-                .as_ref()
-                .is_some_and(|old| new_spec.is_refinement_of(old));
+        let can_narrow = self.list.last_filter.as_ref().is_some_and(|prev| {
+            prev.pixel_type == new_pixel_type
+                && (!prev.editable_only || new_editable)
+                && new_spec.is_refinement_of(&prev.spec)
+        });
 
         // Reset filtered_idx slots that were set by the previous view.
         // First call (or after an image resize) sizes the Vec to w*h;
@@ -276,8 +275,8 @@ impl PngBendApp {
             self.list.filtered_idx.resize(pc, u32::MAX);
         } else {
             for f in &self.list.filtered_view {
-                let (x, y) = f.resolve(pi).xy();
-                let idx = y as usize * w + x as usize;
+                let xy = f.resolve(pi).xy();
+                let idx = xy.y as usize * w + xy.x as usize;
                 if let Some(slot) = self.list.filtered_idx.get_mut(idx) {
                     *slot = u32::MAX;
                 }
@@ -286,7 +285,11 @@ impl PngBendApp {
 
         let mut scratch = String::with_capacity(48);
         let spec = &new_spec;
-        let old_editable = self.list.last_filter_editable_only;
+        let old_editable = self
+            .list
+            .last_filter
+            .as_ref()
+            .is_some_and(|p| p.editable_only);
         if can_narrow {
             // Re-test only the rows that already passed. Rows in the old
             // view already satisfied the old editable_only (if it was set),
@@ -319,17 +322,19 @@ impl PngBendApp {
 
         // Write the new indices back.
         for (i, f) in self.list.filtered_view.iter().enumerate() {
-            let (x, y) = f.resolve(pi).xy();
-            let idx = y as usize * w + x as usize;
+            let xy = f.resolve(pi).xy();
+            let idx = xy.y as usize * w + xy.x as usize;
             if let Some(slot) = self.list.filtered_idx.get_mut(idx) {
                 *slot = i as u32;
             }
         }
 
         // Snapshot for the next call's refinement check.
-        self.list.last_filter_spec = Some(new_spec);
-        self.list.last_filter_editable_only = new_editable;
-        self.list.last_filter_pixel_type = Some(new_pixel_type);
+        self.list.last_filter = Some(FilterSnapshot {
+            spec: new_spec,
+            editable_only: new_editable,
+            pixel_type: new_pixel_type,
+        });
     }
 }
 

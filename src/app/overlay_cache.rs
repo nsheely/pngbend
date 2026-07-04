@@ -1,8 +1,8 @@
-use crate::coords::ImgGeom;
 use crate::deflate::Event;
 use crate::overlays::{
     make_block_overlay_bytes, make_distance_overlay_bytes, make_literal_overlay_bytes,
 };
+use crate::png::PngInfo;
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
 pub(super) enum OverlayMode {
@@ -34,11 +34,34 @@ impl OverlayMode {
             Self::Cascade => "Cascade",
         }
     }
+
+    /// The cacheable event-driven overlay for this mode, or `None` for the
+    /// modes without a cached buffer (`None` renders nothing; `Cascade` is
+    /// rebuilt per click).
+    pub fn event_overlay(self) -> Option<EventOverlay> {
+        match self {
+            Self::Literals => Some(EventOverlay::Literals),
+            Self::Distance => Some(EventOverlay::Distance),
+            Self::Blocks => Some(EventOverlay::Blocks),
+            Self::None | Self::Cascade => None,
+        }
+    }
+}
+
+/// The overlays rendered from the event stream and cached — exactly the
+/// cacheable subset of [`OverlayMode`] (which also has `None` and the
+/// per-click `Cascade`). Keying [`OverlayCache`] on this makes the "only these
+/// three" rule a type rather than a runtime guard.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(super) enum EventOverlay {
+    Literals,
+    Distance,
+    Blocks,
 }
 
 /// Single-slot cache holding the most recently rendered overlay buffer.
 ///
-/// Each event-driven overlay is `w * h * 4` bytes — 16 MB on a 4 MP RGB
+/// Each event-driven overlay is `w * h * 4` bytes: 16 MB on a 4 MP RGB
 /// photo, 256 MB on a 64 MP one. The user sees one overlay at a time
 /// and re-rendering takes ~50 ms, so a single slot trades "instant mode
 /// switch" for two-thirds of the overlay working set back.
@@ -48,7 +71,7 @@ impl OverlayMode {
 /// instead of sitting cold.
 #[derive(Default)]
 pub(super) struct OverlayCache {
-    entry: Option<(OverlayMode, Vec<u8>)>,
+    entry: Option<(EventOverlay, Vec<u8>)>,
 }
 
 impl OverlayCache {
@@ -57,53 +80,47 @@ impl OverlayCache {
     }
 
     /// Drop the cached overlay only when it's the distance one. After
-    /// a `DistRedirect` edit, the redirected ref's distance changes —
+    /// a `DistRedirect` edit, the redirected ref's distance changes,
     /// which recolours its pixels in the distance heatmap, but leaves
     /// literal and block overlays valid (literals didn't move, every
     /// event kept its `block`). Specialised over `clear` so the common
     /// case (current cache is Literals or Blocks) skips the eviction.
     pub fn invalidate_distance(&mut self) {
-        if matches!(self.entry, Some((OverlayMode::Distance, _))) {
+        if matches!(self.entry, Some((EventOverlay::Distance, _))) {
             self.entry = None;
         }
     }
 
-    pub fn get(&self, mode: OverlayMode) -> Option<&Vec<u8>> {
+    pub fn get(&self, overlay: EventOverlay) -> Option<&Vec<u8>> {
         match &self.entry {
-            Some((cached, bytes)) if *cached == mode => Some(bytes),
+            Some((cached, bytes)) if *cached == overlay => Some(bytes),
             _ => None,
         }
     }
 
-    /// Render `mode`'s overlay if it isn't already the cached entry, then
-    /// return the cached bytes. Evicts whatever was cached before. Returns
-    /// `None` for modes that don't have a cacheable buffer (None, Cascade).
+    /// Render `overlay` if it isn't already the cached entry, evicting
+    /// whatever was cached before, then return the cached bytes.
     pub fn ensure(
         &mut self,
-        mode: OverlayMode,
+        overlay: EventOverlay,
         events: &[Event],
-        geom: &ImgGeom,
-        num_blocks: usize,
+        info: &PngInfo,
+        block_starts: &[u32],
         max_distance: u32,
     ) -> Option<&Vec<u8>> {
-        if !matches!(
-            mode,
-            OverlayMode::Literals | OverlayMode::Distance | OverlayMode::Blocks
-        ) {
-            return None;
-        }
-        let already_cached = matches!(&self.entry, Some((cached, _)) if *cached == mode);
+        let already_cached = matches!(&self.entry, Some((cached, _)) if *cached == overlay);
         if !already_cached {
             // Drop the previous slot before rendering the new one so peak
             // memory during the switch stays at one buffer, not two.
             self.entry = None;
-            let bytes = match mode {
-                OverlayMode::Literals => make_literal_overlay_bytes(events, geom),
-                OverlayMode::Distance => make_distance_overlay_bytes(events, geom, max_distance),
-                OverlayMode::Blocks => make_block_overlay_bytes(events, geom, num_blocks),
-                _ => unreachable!("guarded above"),
+            let bytes = match overlay {
+                EventOverlay::Literals => make_literal_overlay_bytes(events, info),
+                EventOverlay::Distance => make_distance_overlay_bytes(events, info, max_distance),
+                EventOverlay::Blocks => {
+                    make_block_overlay_bytes(events, info, block_starts, block_starts.len())
+                }
             };
-            self.entry = Some((mode, bytes));
+            self.entry = Some((overlay, bytes));
         }
         self.entry.as_ref().map(|(_, bytes)| bytes)
     }

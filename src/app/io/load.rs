@@ -9,12 +9,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 
-use crate::coords::ImgGeom;
 use crate::deflate::{DecodeError, DecodedDeflate, decode_deflate};
 use crate::index::{build_pixel_index, build_pos_to_ev, build_reverse_graph};
 use crate::png::{
-    Chunk, ChunksError, PaletteEntry, PngInfo, ZlibError, adler32, concat_idat, decode_palette,
-    parse_ihdr, parse_zlib_stream, read_chunks,
+    Chunk, ChunkType, ChunksError, PaletteEntry, PngInfo, ZlibError, adler32, concat_idat,
+    decode_palette, parse_ihdr, parse_zlib_stream, read_chunks,
 };
 
 use super::super::PngBendApp;
@@ -47,10 +46,12 @@ pub enum LoadError {
     /// Native unfilter or RGBA conversion failed. Distinct from
     /// `Deflate` / `Chunks` errors so the loader can fail cleanly
     /// without claiming the input is malformed when really it just
-    /// hit a corner of the spec the converter doesn't model.
-    Display,
-    /// Width/height past `u16::MAX` or unfiltered output past `u32::MAX`
-    /// — limits set by `PixelRow.xy: (u16, u16)` and `u32` event positions.
+    /// hit a corner of the spec the converter doesn't model. Named
+    /// `Render` (not `Display`) to avoid colliding with the `Display`
+    /// trait this enum also implements.
+    Render,
+    /// Width/height past `u16::MAX` or unfiltered output past `u32::MAX`,
+    /// the limits set by `PixelRow.xy: (u16, u16)` and `u32` event positions.
     Unsupported {
         width: u32,
         height: u32,
@@ -63,7 +64,7 @@ pub enum LoadError {
 /// silently overflow into another pixel's slot.
 pub const MAX_DIMENSION: u32 = u16::MAX as u32;
 
-/// User-facing message — this Display is what the status bar shows.
+/// User-facing message: this Display is what the status bar shows.
 /// The inner [`ChunksError`] / [`ZlibError`] / [`DecodeError`] keep
 /// their technical Display impls for library users and logs; this layer
 /// translates them into something a person opening a PNG can act on.
@@ -90,11 +91,11 @@ impl std::fmt::Display for LoadError {
             Self::Deflate(e) => match e {
                 DecodeError::OutputTooLarge { .. } => write!(
                     f,
-                    "This PNG decompresses to more data than its dimensions claim — possibly a decompression bomb."
+                    "This PNG decompresses to more data than its dimensions claim, a possible decompression bomb."
                 ),
                 _ => write!(f, "This PNG's compressed image data is corrupted."),
             },
-            Self::Display => write!(f, "Couldn't render this PNG."),
+            Self::Render => write!(f, "Couldn't render this PNG."),
             Self::Unsupported {
                 width,
                 height,
@@ -124,13 +125,13 @@ impl std::error::Error for LoadError {
 /// before the load starts so large images stay the user's call.
 ///
 /// Three components:
-/// - **per output byte** — `events`, `output`, `reverse_graph`,
+/// - **per output byte**: `events`, `output`, `reverse_graph`,
 ///   `unfiltered`, and the cascade depth map. ~18 B/byte covers typical
 ///   photo content with margin for highly back-referenced inputs.
-/// - **per pixel** — `pixel_index` + `filtered_idx` + three `w × h × 4`
+/// - **per pixel**: `pixel_index` + `filtered_idx` + three `w × h × 4`
 ///   RGBA buffers (`base_rgba`, `composite_scratch`, one LRU overlay).
 ///   ~24 B/pixel.
-/// - **constant** — egui state, font atlas, Huffman tables, etc. ~16 MB.
+/// - **constant**: egui state, font atlas, Huffman tables, etc. ~16 MB.
 pub fn estimate_working_set_bytes(width: u32, height: u32, bpp: usize) -> u64 {
     let pixels = u64::from(width) * u64::from(height);
     let output_bytes = u64::from(height) * (1 + u64::from(width) * bpp as u64);
@@ -141,7 +142,7 @@ pub fn estimate_working_set_bytes(width: u32, height: u32, bpp: usize) -> u64 {
 }
 
 /// Render a byte count in the closest power-of-2 binary unit (KB / MB /
-/// GB), one decimal place — e.g. `"~2.7 GB"` for the status bar.
+/// GB), one decimal place, e.g. `"~2.7 GB"` for the status bar.
 pub(in crate::app) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -170,7 +171,7 @@ pub(in crate::app) fn peek_ihdr(path: &std::path::Path) -> Option<PngInfo> {
     // 64-byte sniffs may straddle the IHDR CRC; if `read_chunks` rejects
     // a truncated tail that's a peek-only failure, not a load failure, so
     // treat any chunks error as "no preview, fall through to full load."
-    parse_ihdr(&read_chunks(&buf[..n]).ok()?)
+    parse_ihdr(&read_chunks(&buf[..n]).ok()?.chunks)
 }
 
 impl PngBendApp {
@@ -232,7 +233,7 @@ impl PngBendApp {
         self.view.base_rgba = loaded.base_rgba;
         self.view.texture_dirty = true;
         // CoreData holds a CSR reverse graph (two contiguous Vecs), so
-        // dropping it in-place is O(1) — no background-thread drop needed.
+        // dropping it in-place is O(1); no background-thread drop needed.
         self.doc.core = Some(loaded.core);
         self.reset_for_new_file();
         // Post-load display defaults, beyond the generic reset.
@@ -259,11 +260,11 @@ impl PngBendApp {
             };
             self.status = format!(
                 "Loaded {name}  ·  {}×{}, bpp={}, {} DEFLATE block{}{warn}",
-                c.geom.w,
-                c.geom.h,
-                c.geom.bpp,
-                c.num_blocks,
-                if c.num_blocks == 1 { "" } else { "s" },
+                c.info.width,
+                c.info.height,
+                c.info.bpp,
+                c.num_blocks(),
+                if c.num_blocks() == 1 { "" } else { "s" },
             );
         }
     }
@@ -272,7 +273,12 @@ impl PngBendApp {
 fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     let raw = std::fs::read(&path).map_err(LoadError::Io)?;
     let mut parsed = read_chunks(&raw).map_err(LoadError::Chunks)?;
-    let mut warnings = std::mem::take(&mut parsed.warnings);
+    // glasspng reports integrity issues as typed `Warning`s; the loader only
+    // displays them, so flatten to strings via `Display` at the boundary.
+    let mut warnings: Vec<String> = std::mem::take(&mut parsed.warnings)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let chunks = parsed.chunks;
     let info = parse_ihdr(&chunks).ok_or(LoadError::MissingIhdr)?;
     if info.width > MAX_DIMENSION || info.height > MAX_DIMENSION {
@@ -282,11 +288,16 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
             reason: "width and height must each fit in 16 bits (≤ 65535)",
         });
     }
-    // `output_len = h × (1 + w × bpp)` must fit in u32 so event position
-    // fields can address every byte. The dimension check above caps the
-    // multiplier; this catches the case where both dims sit near 65535
-    // and bpp is high.
-    let output_bytes = u64::from(info.height) * (1 + u64::from(info.width) * info.bpp as u64);
+    // `output_len` must fit in u32 so event position fields can address
+    // every byte. The dimension check above caps the multiplier; this
+    // catches the case where both dims sit near 65535 and bpp is high.
+    // Interlaced output is the sum of the seven Adam7 pass sizes, which
+    // has more per-row filter bytes than the progressive raster.
+    let output_bytes = if info.interlaced {
+        crate::png::interlaced_output_len(&info) as u64
+    } else {
+        u64::from(info.height) * (1 + u64::from(info.width) * info.bpp as u64)
+    };
     if output_bytes > u32::MAX as u64 {
         return Err(LoadError::Unsupported {
             width: info.width,
@@ -294,17 +305,17 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
             reason: "unfiltered output exceeds 4 GiB (event positions are u32)",
         });
     }
-    let w = info.width as usize;
-    let h = info.height as usize;
-
     // Palette (only present for indexed PNGs; harmless for others).
-    let palette = chunks.iter().find(|c| &c.typ == b"PLTE").map(|plte| {
-        let trns = chunks
-            .iter()
-            .find(|c| &c.typ == b"tRNS")
-            .map(|c| c.data.as_slice());
-        decode_palette(&plte.data, trns)
-    });
+    let palette = chunks
+        .iter()
+        .find(|c| c.typ == ChunkType::PLTE)
+        .map(|plte| {
+            let trns = chunks
+                .iter()
+                .find(|c| c.typ == ChunkType::TRNS)
+                .map(|c| c.data.as_slice());
+            decode_palette(&plte.data, trns)
+        });
 
     let idat = concat_idat(&chunks);
     if idat.is_empty() {
@@ -313,8 +324,8 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     // Hard errors here are the cases where slicing would land on the
     // wrong bytes (truncation, non-deflate CM, FDICT). FCHECK and the
     // Adler-32 trailer are checksums and surface as warnings instead.
-    let mut zlib = parse_zlib_stream(&idat).map_err(LoadError::Zlib)?;
-    warnings.append(&mut zlib.warnings);
+    let zlib = parse_zlib_stream(&idat).map_err(LoadError::Zlib)?;
+    warnings.extend(zlib.warnings.iter().map(ToString::to_string));
     let zlib_header = zlib.header;
     let stored_adler = zlib.stored_adler;
     let deflate_buf = zlib.deflate_buf.to_vec();
@@ -326,28 +337,38 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
     let decoded =
         decode_deflate(&deflate_buf, Some(output_bytes as usize)).map_err(LoadError::Deflate)?;
     if stored_adler != adler32(&decoded.output) {
-        warnings.push("stale checksum on PNG image data".to_string());
+        warnings.push(crate::png::Warning::StaleImageAdler.to_string());
     }
-    let geom = ImgGeom::new(w as u32, h as u32, info.bits_per_pixel());
 
     // Unfilter and convert. Both run natively for every PNG colour mode
     // the spec defines, including sub-byte greyscale and indexed depths,
-    // so an unfilter / convert failure here is a genuine decode error
-    // rather than an "unsupported format" signal.
-    let unfiltered =
-        crate::png::unfilter(&decoded.output, &info).map_err(|_| LoadError::Display)?;
-    let base_rgba = crate::png::to_rgba8(&unfiltered, &info, palette.as_deref())
-        .map_err(|_| LoadError::Display)?;
+    // so a failure here is a genuine decode error rather than an
+    // "unsupported format" signal. Interlaced images reassemble their
+    // seven passes; `unfiltered` is then the per-pass raw bytes.
+    let (unfiltered, base_rgba) = if info.interlaced {
+        let unfiltered = crate::png::deinterlace_unfilter(&decoded.output, &info)
+            .map_err(|_| LoadError::Render)?;
+        let base_rgba =
+            crate::png::deinterlace_to_rgba8(&decoded.output, &info, palette.as_deref())
+                .map_err(|_| LoadError::Render)?;
+        (unfiltered, base_rgba)
+    } else {
+        let unfiltered =
+            crate::png::unfilter(&decoded.output, &info).map_err(|_| LoadError::Render)?;
+        let base_rgba = crate::png::to_rgba8(&unfiltered, &info, palette.as_deref())
+            .map_err(|_| LoadError::Render)?;
+        (unfiltered, base_rgba)
+    };
 
-    let mut core = build_core_from_decoded(decoded, info, palette, geom);
+    let mut core = build_core_from_decoded(decoded, info, palette);
     core.unfiltered = unfiltered;
 
     // Drop the IDAT bytes inside `chunks`: `deflate_buf` already holds the
     // decompressed source of truth, and save_png re-emits a fresh IDAT
     // built from the (possibly edited) `deflate_buf`. Holding both costs
-    // ~3–4 MB on a typical 4 MP photo and scales linearly with input size.
+    // ~3-4 MB on a typical 4 MP photo and scales linearly with input size.
     let mut chunks = chunks;
-    for c in chunks.iter_mut().filter(|c| &c.typ == b"IDAT") {
+    for c in chunks.iter_mut().filter(|c| c.typ == ChunkType::IDAT) {
         c.data = Vec::new();
     }
 
@@ -363,20 +384,19 @@ fn load_file(path: PathBuf) -> Result<LoadedFile, LoadError> {
 }
 
 /// Build a fully-indexed [`CoreData`] from a freshly decoded DEFLATE
-/// stream plus geometry and palette. Leaves [`CoreData::unfiltered`]
-/// empty — the caller fills it after running the row-filter inverse.
+/// stream plus IHDR info and palette. Leaves [`CoreData::unfiltered`]
+/// empty; the caller fills it after running the row-filter inverse.
 pub(in crate::app) fn build_core_from_decoded(
     decoded: DecodedDeflate,
     info: PngInfo,
     palette: Option<Vec<PaletteEntry>>,
-    geom: ImgGeom,
 ) -> CoreData {
     let DecodedDeflate {
         output,
         events,
         lit_encs,
         dist_encs,
-        num_blocks,
+        block_starts,
         max_distance,
     } = decoded;
     // `pos_to_ev` lives only for the duration of this function. The
@@ -386,23 +406,61 @@ pub(in crate::app) fn build_core_from_decoded(
     // pixel index is built nothing else needs the dense map, so the
     // explicit `drop` releases the multi-MB buffer before storing the
     // long-lived `CoreData`.
+    let raster = crate::Raster::new(info);
     let pos_to_ev = build_pos_to_ev(&events, output.len());
     let reverse_graph = build_reverse_graph(&events, output.len());
-    let pixel_index = build_pixel_index(&events, &output, &pos_to_ev, &lit_encs, &dist_encs, &geom);
+    let pixel_index = build_pixel_index(
+        &events,
+        &output,
+        &pos_to_ev,
+        &lit_encs,
+        &dist_encs,
+        &block_starts,
+        &raster,
+    );
     drop(pos_to_ev);
 
     CoreData {
-        geom,
         info,
+        raster,
         palette,
         output,
         events,
         lit_encs,
         dist_encs,
-        num_blocks,
+        block_starts,
         pixel_index,
         reverse_graph,
         unfiltered: Vec::new(),
         max_distance,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deflate::serialize_stored;
+    use crate::png::ColorType;
+
+    #[test]
+    fn build_core_maps_interlaced_pixels() {
+        // 2x2 greyscale, Adam7. Passes 1, 6, 7 place the four pixels; the
+        // output is filter-byte-0 rows [pass1, pass6, pass7].
+        let output = vec![0u8, 10, 0, 20, 0, 30, 40];
+        let decoded = decode_deflate(&serialize_stored(&output), None).expect("decode");
+        let mut info = PngInfo::new(2, 2, 8, ColorType::Greyscale);
+        info.interlaced = true;
+        let core = build_core_from_decoded(decoded, info, None);
+        assert!(core.raster.info().interlaced);
+        // build_pixel_index walked the interlaced raster; every screen pixel
+        // appears as a literal row at its reassembled position.
+        let mut coords: Vec<(u32, u32)> = core
+            .pixel_index
+            .lit
+            .iter()
+            .map(|r| (r.x(), r.y()))
+            .collect();
+        coords.sort_unstable();
+        assert_eq!(coords, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
     }
 }

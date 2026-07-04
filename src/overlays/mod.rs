@@ -1,14 +1,13 @@
-//! Overlay rendering — the RGBA buffers that get alpha-composited over the
-//! base image to visualise event structure.
+//! Overlay rendering: RGBA buffers alpha-composited over the base image to
+//! visualise event structure.
 //!
-//! - [`event`] — per-event overlays (literal, distance, block). One RGBA
+//! - `event`: per-event overlays (literal, distance, block). One RGBA
 //!   buffer per mode, cached by [`crate::app`] and invalidated on load.
-//! - [`cascade`] — the BFS-driven cascade overlay + PNG row-filter
+//! - `cascade`: the BFS-driven cascade overlay + PNG row-filter
 //!   propagation, recomputed per pixel click.
 //!
-//! The compositor itself lives at [`crate::composite`]: it consumes one of
-//! the buffers built here, but it isn't overlay generation, so it sits at
-//! the crate root rather than in this module.
+//! The compositor at [`crate::composite`] consumes one of these buffers but
+//! isn't overlay generation, so it sits at the crate root, not here.
 
 mod cascade;
 mod event;

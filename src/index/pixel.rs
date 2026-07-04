@@ -1,12 +1,12 @@
 //! Pixel-level summaries for the side panel.
 //!
 //! Walks the image in raster order, consults [`super::build_pos_to_ev`]
-//! to find the event that produced each pixel's first byte, and splits
-//! pixels into:
-//! - **literal rows** — any channel is a literal whose Huffman code has a
+//! for the event that produced each pixel's first byte, and splits pixels
+//! into:
+//! - **literal rows**: any channel is a literal whose Huffman code has a
 //!   same-length swap alternative within this block.
-//! - **back-reference rows** — no channel is a literal, and at least one
-//!   channel is produced by a redirectable back-ref.
+//! - **back-reference rows**: no channel is a literal, at least one is
+//!   produced by a redirectable back-ref.
 //!
 //! Rows store only structural data (`xy`, `rgb`, `editable`); the
 //! sidebar's virtual-scroll callback formats each visible row's display
@@ -14,53 +14,53 @@
 //! millions of unseen pixels. The filter UI matches against a reused
 //! scratch `String` for the same reason.
 //!
-//! Per-block editability is summarised up front: a `[bool; 256]` per
-//! lit alphabet (one slot per literal symbol) and a `u32` bitmask per
-//! dist alphabet (30 symbols → fits in 30 bits). Each entry is one
-//! load / bit-test in the per-pixel inner loop. Built in `O(alphabet)`
-//! per block by counting Huffman-length buckets, not `O(alphabet²)`.
+//! Per-block editability is summarised up front: a `[bool; 256]` per lit
+//! alphabet (one slot per literal symbol) and a `u32` bitmask per dist
+//! alphabet (30 symbols → 30 bits). Each entry is one load / bit-test in
+//! the per-pixel inner loop. Built in `O(alphabet)` per block by counting
+//! Huffman-length buckets, not `O(alphabet²)`.
 
 use rayon::prelude::*;
 
-use crate::coords::ImgGeom;
-use crate::deflate::constants::{DBASE, DEXT};
-use crate::deflate::{EncTable, Event};
+use crate::coords::PixelXY;
+use crate::deflate::{DBASE, DEXT};
+use crate::deflate::{EncTable, Event, SymCode};
 
 /// One row in the pixel-list side panel: image-space coordinates, the
-/// pixel's RGB swatch colour, and whether at least one valid edit is
-/// available for it. `Copy` is cheap (8 bytes) so call sites pass by value.
+/// pixel's RGB swatch colour, and whether it has at least one valid edit.
+/// `Copy` is cheap (8 bytes) so call sites pass by value.
 ///
-/// Coordinates are packed as `u16` — image dimensions are capped at
-/// `u16::MAX` at load time, and on a multi-megapixel index this saves
-/// 4 bytes per row vs. `(u32, u32)`. The [`PixelRow::xy`] accessor returns
-/// the conventional `(u32, u32)` tuple call sites expect.
+/// Coordinates are packed as `u16`: image dimensions are capped at
+/// `u16::MAX` at load, saving 4 bytes per row vs. two `u32`s on a
+/// multi-megapixel index. The [`PixelRow::xy`] accessor returns a
+/// [`PixelXY`] for the coordinate-safe app surface.
 #[derive(Debug, Clone, Copy)]
 pub struct PixelRow {
     xy: (u16, u16),
     pub rgb: [u8; 3],
-    /// `true` when this pixel has at least one applicable edit — a
+    /// `true` when this pixel has at least one applicable edit: a
     /// same-Huffman-width literal swap, or a redirectable back-ref
-    /// alternative. The sidebar greys non-`has_edit` rows out and the
-    /// "Editable only" filter checkbox hides them.
+    /// alternative. The sidebar greys non-`has_edit` rows out; the
+    /// "Editable only" filter hides them.
     pub has_edit: bool,
 }
 
 impl PixelRow {
-    pub fn new(x: u32, y: u32, rgb: [u8; 3], has_edit: bool) -> Self {
+    pub fn new(xy: PixelXY, rgb: [u8; 3], has_edit: bool) -> Self {
         debug_assert!(
-            x <= u16::MAX as u32 && y <= u16::MAX as u32,
+            xy.x <= u16::MAX as u32 && xy.y <= u16::MAX as u32,
             "PixelRow coordinates must fit in u16",
         );
         Self {
-            xy: (x as u16, y as u16),
+            xy: (xy.x as u16, xy.y as u16),
             rgb,
             has_edit,
         }
     }
 
     #[inline]
-    pub fn xy(self) -> (u32, u32) {
-        (self.xy.0 as u32, self.xy.1 as u32)
+    pub fn xy(self) -> PixelXY {
+        PixelXY::new(self.xy.0 as u32, self.xy.1 as u32)
     }
 
     #[inline]
@@ -76,21 +76,20 @@ impl PixelRow {
 
 /// Per-pixel summaries for the "Literals" and "Backrefs" radio buttons.
 /// `n_lit_with_edit` is counted during build so the sidebar's pixel-count
-/// label doesn't need a second full-scan pass over `lit`. Every entry in
-/// `refs` is already filtered to redirectable refs, so each has at least
-/// one applicable edit by construction.
+/// label needs no second pass over `lit`. Every entry in `refs` is already
+/// filtered to redirectable refs, so each is editable by construction.
 pub struct PixelIndex {
     pub lit: Vec<PixelRow>,
     pub refs: Vec<PixelRow>,
     pub n_lit_with_edit: usize,
 }
 
-/// One literal symbol (0..=255) per slot — `true` if this block's alphabet
-/// contains at least one other literal with the same Huffman length (i.e.
-/// the swap edit has a target). 256 bytes per block, contiguous.
+/// One literal symbol (0..=255) per slot; `true` if this block's alphabet
+/// holds at least one other literal with the same Huffman length (the swap
+/// edit has a target). 256 bytes per block, contiguous.
 type LitSwapSet = [bool; 256];
 
-/// Bitmask over distance symbols (0..=29) — bit `i` is set if dist-symbol
+/// Bitmask over distance symbols (0..=29): bit `i` is set if dist-symbol
 /// `i` has at least one compatible redirect target in this block (same
 /// Huffman length and same `DEXT`). One `u32` per block.
 type DistRedirMask = u32;
@@ -101,51 +100,75 @@ pub fn build_pixel_index(
     pos_to_ev: &[u32],
     lit_encs: &[EncTable],
     dist_encs: &[EncTable],
-    geom: &ImgGeom,
+    block_starts: &[u32],
+    raster: &crate::Raster,
 ) -> PixelIndex {
-    let w = geom.w as usize;
-    let h = geom.h as usize;
-    let bpp = geom.bpp as usize;
-    let pixels_per_byte = geom.pixels_per_byte() as usize;
+    let info = raster.info();
+    let w = info.width as usize;
+    let h = info.height as usize;
+    let bpp = info.bpp;
+    let pixels_per_byte = raster.pixels_per_byte() as usize;
 
     let lit_swap_syms = precompute_lit_swap_syms(lit_encs);
     let blk_redir_syms = precompute_redirectable_dist_syms(dist_encs);
 
-    // Per-event redirectability cache. The classifier below would
-    // otherwise call `is_ref_redirectable` once per byte of every ref
-    // (`total_copy_len × alts`); precomputing it once per event drops
-    // the total to `events × alts`.
-    let redir_event: Vec<bool> = events
-        .iter()
-        .map(|e| match e {
-            Event::Ref(r) => is_ref_redirectable(r, &blk_redir_syms, dist_encs),
-            _ => false,
+    // Per-event class byte. The hot per-pixel loop resolves events by
+    // output position (`pos_to_ev`), so every per-channel read adds memory
+    // traffic. Folding each event's block-derived editability into one byte
+    // lets `classify_pixel` do a single `u8` load per channel instead of
+    // chasing `events`, a block table, and the per-block Huffman sets, and
+    // runs `is_ref_redirectable` once per event, not once per copied byte.
+    // Blocks own disjoint, contiguous event ranges, so classification fans
+    // out across them with the block index as a free per-range constant, no
+    // per-event block lookup. Dropped when the build returns; nothing
+    // long-lived carries a per-event block.
+    let event_class: Vec<EventClass> = (0..block_starts.len())
+        .into_par_iter()
+        .flat_map_iter(|block| {
+            let start = block_starts[block] as usize;
+            let end = block_starts
+                .get(block + 1)
+                .map_or(events.len(), |&e| e as usize);
+            let lit_set = lit_swap_syms.get(block);
+            let blk_redir = &blk_redir_syms;
+            events[start..end].iter().map(move |e| match e {
+                Event::Lit(lit) => {
+                    if lit_set.is_some_and(|s| s[lit.symbol as usize]) {
+                        EventClass::LitSwap
+                    } else {
+                        EventClass::LitNoSwap
+                    }
+                }
+                Event::Ref(r) => {
+                    if is_ref_redirectable(r, block, blk_redir, dist_encs) {
+                        EventClass::RefRedir
+                    } else {
+                        EventClass::Skip
+                    }
+                }
+            })
         })
         .collect();
 
-    // Rows are independent after the two precomputes — split across rayon
-    // workers and stitch the per-row collections back in `y` order so the
-    // output `lit` / `refs` stay sorted by `(y, x)` as downstream code
-    // (binary search in `select.rs`, merge-sort in `filter_all`) expects.
+    // Rows are independent after the two precomputes: split across rayon
+    // workers and stitch the per-row collections back in `y` order so
+    // `lit` / `refs` stay sorted by `(y, x)` as downstream code (binary
+    // search in `select.rs`, merge-sort in `filter_all`) expects.
     //
-    // At sub-byte depths multiple x-values share one byte (and therefore
-    // one event). Step `x` by `pixels_per_byte` so the list emits one
-    // entry per byte, named by the cluster's first pixel — for ≥ 8-bit
-    // depths `pixels_per_byte == 1` and behaviour is unchanged.
+    // At sub-byte depths multiple x-values share one byte, hence one event.
+    // Step `x` by `pixels_per_byte` so the list emits one entry per byte,
+    // named by the cluster's first pixel. For ≥ 8-bit depths
+    // `pixels_per_byte == 1` and behaviour is unchanged.
     let per_row: Vec<RowBuckets> = (0..h)
         .into_par_iter()
         .map(|y| {
             let mut buckets = RowBuckets::new(w);
             for x in (0..w).step_by(pixels_per_byte) {
-                let base = geom
-                    .xy_to_out(crate::coords::PixelXY::new(x as u32, y as u32))
-                    .0 as usize;
+                let base = raster.xy_to_out(PixelXY::new(x as u32, y as u32)).0 as usize;
                 if base >= output.len() {
                     continue;
                 }
-                let Some(kind) =
-                    classify_pixel(base, bpp, pos_to_ev, events, &lit_swap_syms, &redir_event)
-                else {
+                let Some(kind) = classify_pixel(base, bpp, pos_to_ev, &event_class) else {
                     continue;
                 };
 
@@ -153,8 +176,7 @@ pub fn build_pixel_index(
                 let g = output.get(base + 1).copied().unwrap_or(r);
                 let b = output.get(base + 2).copied().unwrap_or(r);
                 let row = PixelRow::new(
-                    x as u32,
-                    y as u32,
+                    PixelXY::new(x as u32, y as u32),
                     [r, g, b],
                     matches!(kind, PixelKind::Lit { has_swap: true } | PixelKind::Ref),
                 );
@@ -200,8 +222,8 @@ struct RowBuckets {
 
 impl RowBuckets {
     fn new(w: usize) -> Self {
-        // Most rows have at most a few hundred entries on a typical photo;
-        // a quarter-row capacity avoids the first three doublings.
+        // A few hundred entries per row on a typical photo; quarter-row
+        // capacity avoids the first three doublings.
         let cap = (w / 4).max(8);
         Self {
             lit: Vec::with_capacity(cap),
@@ -212,30 +234,43 @@ impl RowBuckets {
 }
 
 enum PixelKind {
-    /// A literal pixel. `has_swap` is true when the block's alphabet
-    /// holds at least one other literal with the same Huffman code
-    /// length — i.e. the byte can be rewritten without disturbing
-    /// bit-alignment.
+    /// A literal pixel. `has_swap` is true when the block's alphabet holds
+    /// at least one other literal with the same Huffman code length, so the
+    /// byte can be rewritten without disturbing bit-alignment.
     Lit { has_swap: bool },
-    /// A back-reference pixel. The build path only emits this variant
-    /// for refs whose distance has at least one same-width alternative,
-    /// so every `Ref` row is editable by construction.
+    /// A back-reference pixel. Only emitted for refs whose distance has at
+    /// least one same-width alternative, so every `Ref` row is editable.
     Ref,
 }
 
-/// Decide how to classify a pixel given its channel-owning events.
-/// - If any channel is owned by a literal event → `Lit`, and `has_swap`
-///   if that literal has a same-length swap alternative.
-/// - Else if any channel is owned by a redirectable back-ref → `Ref`.
+/// Per-event class byte, precomputed in `build_pixel_index`. Encodes only
+/// what the per-pixel classifier needs (literal vs redirectable ref, plus
+/// whether a literal has a same-length swap), so the hot loop reads one
+/// byte per channel and never touches `events` or the per-block Huffman
+/// tables. A non-redirectable ref is `SKIP`, contributing nothing like an
+/// unowned channel.
+/// Per-event class for the pixel index's hot loop, one byte each (`#[repr(u8)]`
+/// keeps the `Vec` the same size as the old `Vec<u8>`).
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum EventClass {
+    Skip,
+    LitNoSwap,
+    LitSwap,
+    RefRedir,
+}
+
+/// Classify a pixel from its channel-owning events' class bytes.
+/// - Any channel owned by a literal event → `Lit`, `has_swap` if that
+///   literal has a same-length swap alternative.
+/// - Else any channel owned by a redirectable back-ref → `Ref`.
 /// - Else the pixel is invisible to the side panel.
 #[inline]
 fn classify_pixel(
     base: usize,
     bpp: usize,
     pos_to_ev: &[u32],
-    events: &[Event],
-    lit_swap_syms: &[LitSwapSet],
-    redir_event: &[bool],
+    event_class: &[EventClass],
 ) -> Option<PixelKind> {
     let mut lit_seen = false;
     let mut lit_has_swap = false;
@@ -250,21 +285,18 @@ fn classify_pixel(
         if ev_idx == u32::MAX {
             continue;
         }
-        match &events[ev_idx as usize] {
-            Event::Lit(lit) => {
+        match event_class
+            .get(ev_idx as usize)
+            .copied()
+            .unwrap_or(EventClass::Skip)
+        {
+            EventClass::LitNoSwap => lit_seen = true,
+            EventClass::LitSwap => {
                 lit_seen = true;
-                if lit_swap_syms
-                    .get(lit.block as usize)
-                    .is_some_and(|s| s[lit.symbol as usize])
-                {
-                    lit_has_swap = true;
-                }
+                lit_has_swap = true;
             }
-            Event::Ref(_) => {
-                if !ref_seen && redir_event.get(ev_idx as usize).copied().unwrap_or(false) {
-                    ref_seen = true;
-                }
-            }
+            EventClass::RefRedir => ref_seen = true,
+            EventClass::Skip => {}
         }
     }
 
@@ -280,10 +312,10 @@ fn classify_pixel(
 }
 
 /// For each block, which literal symbols (0..=255) have at least one
-/// same-length alternative in that block's Huffman alphabet.
-/// `counts[c]` is the number of literal symbols with Huffman length `c`;
-/// a symbol is swappable iff its bucket has more than one entry. Two
-/// `O(alphabet)` passes per block (count, then mark).
+/// same-length alternative in its Huffman alphabet. `counts[c]` is the
+/// number of literal symbols with Huffman length `c`; a symbol is swappable
+/// iff its bucket has more than one entry. Two `O(alphabet)` passes per
+/// block (count, then mark).
 fn precompute_lit_swap_syms(lit_encs: &[EncTable]) -> Vec<LitSwapSet> {
     lit_encs
         .iter()
@@ -291,13 +323,13 @@ fn precompute_lit_swap_syms(lit_encs: &[EncTable]) -> Vec<LitSwapSet> {
             let raw = le.raw();
             let lit_slice = &raw[..raw.len().min(256)];
             let mut counts = [0u16; 16];
-            for &(_, clen) in lit_slice {
+            for &SymCode { len: clen, .. } in lit_slice {
                 if clen != 0 && (clen as usize) < counts.len() {
                     counts[clen as usize] = counts[clen as usize].saturating_add(1);
                 }
             }
             let mut valid = [false; 256];
-            for (sym, &(_, clen)) in lit_slice.iter().enumerate() {
+            for (sym, &SymCode { len: clen, .. }) in lit_slice.iter().enumerate() {
                 if clen != 0 && (clen as usize) < counts.len() && counts[clen as usize] > 1 {
                     valid[sym] = true;
                 }
@@ -309,7 +341,7 @@ fn precompute_lit_swap_syms(lit_encs: &[EncTable]) -> Vec<LitSwapSet> {
 
 /// For each block, which dist-symbols have a compatible redirect target
 /// (same Huffman length AND same extra-bits count). Bucketed by
-/// `(clen, dext)` — symbols in a bucket of size > 1 are redirectable.
+/// `(clen, dext)`; symbols in a bucket of size > 1 are redirectable.
 /// Returns a `u32` mask per block; bit `i` = dist-symbol `i` is editable.
 fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMask> {
     dist_encs
@@ -317,13 +349,13 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
         .map(|de| {
             let raw = de.raw();
             // DEFLATE: dist alphabet is 0..30, dist clen ≤ 15, DEXT ≤ 13.
-            // Symbols 30/31 are reserved by RFC 1951 — ignore them even
-            // if a fixed-Huffman block's `EncTable` allocates 32 slots,
-            // since `DEXT` is only defined for 0..30.
+            // Symbols 30/31 are reserved (RFC 1951); ignore them even if a
+            // fixed-Huffman block's `EncTable` allocates 32 slots, since
+            // `DEXT` is only defined for 0..30.
             let limit = raw.len().min(30);
             let raw = &raw[..limit];
             let mut counts = [[0u8; 16]; 16];
-            for (sym, &(_, clen)) in raw.iter().enumerate() {
+            for (sym, &SymCode { len: clen, .. }) in raw.iter().enumerate() {
                 if clen == 0 {
                     continue;
                 }
@@ -333,7 +365,7 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
                 }
             }
             let mut mask: u32 = 0;
-            for (sym, &(_, clen)) in raw.iter().enumerate() {
+            for (sym, &SymCode { len: clen, .. }) in raw.iter().enumerate() {
                 if clen == 0 {
                     continue;
                 }
@@ -349,12 +381,12 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
 
 /// Iterate dist-symbols in `de` that are valid redirect targets for the
 /// back-reference at `(out_pos, src_out_pos)` with current symbol `cur_sym`.
-/// "Valid" means: same Huffman length, same `DEXT` extra-bits class, and
-/// the new source position is non-negative. Yields
+/// Valid: same Huffman length, same `DEXT` extra-bits class, and a
+/// non-negative new source position. Yields
 /// `(new_dist_sym, new_src_out_pos, new_distance)` for each.
 ///
-/// Returns `None` only when `cur_sym` itself isn't present in `de` — the
-/// caller has nothing to redirect from in that case.
+/// `None` only when `cur_sym` isn't present in `de`: nothing to redirect
+/// from.
 fn compatible_dist_alts<'a>(
     de: &'a EncTable,
     cur_sym: u8,
@@ -362,39 +394,35 @@ fn compatible_dist_alts<'a>(
     src_out_pos: u32,
 ) -> Option<impl Iterator<Item = (u8, u32, u32)> + 'a> {
     // Symbols 30/31 are reserved (RFC 1951) and have no `DEXT`/`DBASE`
-    // entries — refuse them up front rather than panic at the lookup.
+    // entries; refuse them up front rather than panic at the lookup.
     if (cur_sym as usize) >= DBASE.len() {
         return None;
     }
-    let (_, cur_clen) = de.get(cur_sym as u16)?;
+    let cur_clen = de.get(cur_sym as u16)?.len;
     let cur_dext = DEXT[cur_sym as usize];
     let distance = out_pos - src_out_pos;
     let extra_val = distance.saturating_sub(DBASE[cur_sym as usize]);
     // `de.raw()` may run to 32 entries for a fixed-Huffman block, but
-    // `DBASE`/`DEXT` are only defined for 0..30 — clip the iteration.
+    // `DBASE`/`DEXT` are only defined for 0..30, so clip the iteration.
     let limit = de.raw().len().min(DBASE.len());
-    Some(
-        de.raw()[..limit]
-            .iter()
-            .enumerate()
-            .filter_map(move |(sym, &(_, clen))| {
-                if clen == 0 || (sym as u8) == cur_sym || clen != cur_clen || DEXT[sym] != cur_dext
-                {
-                    return None;
-                }
-                let new_dist = DBASE[sym] + extra_val;
-                let new_src_signed = out_pos as i64 - new_dist as i64;
-                (new_src_signed >= 0).then_some((sym as u8, new_src_signed as u32, new_dist))
-            }),
-    )
+    Some(de.raw()[..limit].iter().enumerate().filter_map(
+        move |(sym, &SymCode { len: clen, .. })| {
+            if clen == 0 || (sym as u8) == cur_sym || clen != cur_clen || DEXT[sym] != cur_dext {
+                return None;
+            }
+            let new_dist = DBASE[sym] + extra_val;
+            let new_src_signed = out_pos as i64 - new_dist as i64;
+            (new_src_signed >= 0).then_some((sym as u8, new_src_signed as u32, new_dist))
+        },
+    ))
 }
 
 fn is_ref_redirectable(
     r: &crate::deflate::RefEvent,
+    block: usize,
     blk_redir_syms: &[DistRedirMask],
     dist_encs: &[EncTable],
 ) -> bool {
-    let block = r.block as usize;
     // Per-block bitset rules out symbols that have no alternatives anywhere
     // in the table, before we touch the per-event distance math.
     let Some(&mask) = blk_redir_syms.get(block) else {
@@ -453,7 +481,7 @@ mod tests {
     fn valid_dist_alts_skips_negative_src() {
         let de = dist_table_of(&[
             (0, 0b0, 1),  // DBASE=1
-            (15, 0b1, 1), // DBASE=193 — too large for out_pos=10
+            (15, 0b1, 1), // DBASE=193, too large for out_pos=10
         ]);
         assert!(valid_dist_alts(0, 0, 10, 9, &[de]).is_empty());
     }
@@ -479,7 +507,7 @@ mod tests {
     fn precompute_dist_redir_ignores_reserved_symbols_30_31() {
         // Fixed-Huffman blocks build a 32-slot dist EncTable. Symbols 30
         // and 31 are reserved (RFC 1951) and have no `DEXT`/`DBASE`
-        // entries — the precompute must skip them rather than panic.
+        // entries; the precompute must skip them rather than panic.
         let mut de = EncTable::new(32);
         for sym in 0u16..32 {
             de.set(sym, sym, 5);
@@ -493,8 +521,8 @@ mod tests {
     fn precompute_dist_redir_sets_expected_bits() {
         let de = dist_table_of(&[
             (1, 0b00, 3),  // DBASE=2,  DEXT=0
-            (2, 0b01, 3),  // DBASE=3,  DEXT=0 — same (clen,dext) as sym 1
-            (4, 0b10, 3),  // DBASE=5,  DEXT=1 — alone in (3, 1) bucket
+            (2, 0b01, 3),  // DBASE=3,  DEXT=0, same (clen,dext) as sym 1
+            (4, 0b10, 3),  // DBASE=5,  DEXT=1, alone in (3, 1) bucket
             (5, 0b110, 4), // alone in (4, 1) bucket
         ]);
         let masks = precompute_redirectable_dist_syms(&[de]);

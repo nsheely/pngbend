@@ -10,21 +10,18 @@ use std::collections::HashMap;
 
 use egui::Color32;
 
-use crate::coords::OutPos;
-use crate::deflate::{Event, RefEvent};
+use crate::coords::{OutPos, PixelXY};
+use crate::deflate::{EncTable, Event, RefEvent, SymCode, block_of};
 use crate::index::{CascadeScratch, PixelRow, event_at, valid_dist_alts};
 use crate::overlays::{compute_filter_expansion, make_cascade_overlay_bytes};
 
 use super::PngBendApp;
-use super::edit::{EditAction, EditKind, Patch};
+use super::edit::{ByteWrite, EditAction, EditKind, Patch};
 use super::io::CoreData;
 use super::overlay_cache::OverlayMode;
 
-const CH_NAMES: [&str; 4] = ["R", "G", "B", "A"];
-
-/// What triggered a call to [`PngBendApp::select_pixel`]. Drives whether
-/// the click is snapped, whether the list scrolls, and whether the cascade
-/// overlay rebuilds.
+/// What triggered a call to [`PngBendApp::select_pixel`]. Drives snapping,
+/// list scrolling, and cascade-overlay rebuild.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SelectSource {
     /// User clicked the image. Snap to the nearest filtered pixel; scroll
@@ -34,13 +31,13 @@ pub(super) enum SelectSource {
     /// End). The list owns focus; we scroll to keep the new selection in
     /// view but don't snap.
     ListNav,
-    /// Selection re-derives from existing state — a list-row click or a
+    /// Selection re-derives from existing state: a list-row click or a
     /// post-redirect refocus. The originator already has focus, so neither
     /// snap nor scroll.
     Refocus,
     /// Side-panel refresh after an in-place literal swap. LZ77 topology is
     /// unchanged, so the cascade overlay painted on screen is still
-    /// correct — keep it instead of rebuilding.
+    /// correct; keep it instead of rebuilding.
     AfterLiteralSwap,
 }
 
@@ -81,31 +78,31 @@ struct LitPatchSite {
 }
 
 impl PngBendApp {
-    pub(super) fn select_pixel(&mut self, x: u32, y: u32, source: SelectSource) {
-        let (mut sx, sy) = if source.snaps_to_filtered() {
-            self.snap_to_nearest_filtered(x, y)
+    pub(super) fn select_pixel(&mut self, xy: PixelXY, source: SelectSource) {
+        let mut sel = if source.snaps_to_filtered() {
+            self.snap_to_nearest_filtered(xy)
         } else {
-            (x, y)
+            xy
         };
         // Snap to the byte's cluster start so the sidebar row, info
         // text, and cascade highlight all agree on which cluster was
         // clicked. For ≥ 8-bit depths `pixels_per_byte == 1` and the
         // arithmetic is a no-op.
         if let Some(c) = self.doc.core.as_ref() {
-            let ppb = c.geom.pixels_per_byte();
-            sx = (sx / ppb) * ppb;
+            let ppb = c.raster.pixels_per_byte();
+            sel.x = (sel.x / ppb) * ppb;
         }
         self.reset_edit_state();
-        self.sel.sel_pixel = Some((sx, sy));
+        self.sel.sel_pixel = Some(sel);
 
         let Some(c) = self.doc.core.as_ref() else {
             return;
         };
-        let base_raw = c.geom.xy_to_out(crate::coords::PixelXY::new(sx, sy)).0 as usize;
+        let base_raw = c.raster.xy_to_out(sel).0 as usize;
         let evs = gather_pixel_events(c, base_raw);
 
         if evs.is_empty() {
-            self.sel.info_text = format!("No event for pixel ({sx}, {sy})");
+            self.sel.info_text = format!("No event for pixel ({}, {})", sel.x, sel.y);
             if source.rebuilds_cascade() {
                 self.view.cascade_rgba = None;
             }
@@ -118,7 +115,7 @@ impl PngBendApp {
             edit_options,
             backref_src,
             cascade_positions,
-        } = build_selection_data(c, &evs, sx, sy, base_raw);
+        } = build_selection_data(c, &evs, sel, base_raw);
 
         self.sel.backref_src = backref_src;
         self.sel.edit_options = edit_options;
@@ -128,12 +125,20 @@ impl PngBendApp {
         }
 
         if source.rebuilds_cascade() {
-            if cascade_positions.is_empty() {
+            // The cascade overlay projects output positions to pixels via the
+            // progressive layout; skip it for interlaced images (overlays
+            // aren't pass-aware yet).
+            let progressive = self
+                .doc
+                .core
+                .as_ref()
+                .is_some_and(|c| c.overlays_supported());
+            if cascade_positions.is_empty() || !progressive {
                 self.view.cascade_rgba = None;
             } else {
-                // Split-borrow: `view.cascade_scratch` is mut-borrowed while
-                // `doc.core` stays immutably borrowed — disjoint sub-struct
-                // fields, so the borrow checker is happy.
+                // Split-borrow: `view.cascade_scratch` mut-borrowed while
+                // `doc.core` stays immutably borrowed; disjoint sub-struct
+                // fields.
                 let c = self.doc.core.as_ref().expect("checked above");
                 let summary = compute_cascade_for_pixel(
                     c,
@@ -152,7 +157,7 @@ impl PngBendApp {
         }
 
         if source.scrolls_list()
-            && let Some(row) = self.filtered_pos((sx, sy))
+            && let Some(row) = self.filtered_pos(sel)
         {
             self.list.list_scroll_to = Some(row);
         }
@@ -165,52 +170,64 @@ impl PngBendApp {
     /// disturbing the cascade overlay. The literal-swap edit path uses this
     /// to refresh edit options and info text after a topology-stable edit.
     pub(super) fn refresh_selection_after_literal_swap(&mut self) {
-        let Some((sx, sy)) = self.sel.sel_pixel else {
+        let Some(sel) = self.sel.sel_pixel else {
             return;
         };
-        self.select_pixel(sx, sy, SelectSource::AfterLiteralSwap);
+        self.select_pixel(sel, SelectSource::AfterLiteralSwap);
     }
 
-    /// Find the filtered-view pixel whose `(x, y)` is closest (by squared
-    /// Euclidean distance) to the click coordinates. Falls through to the
+    /// Find the filtered-view pixel whose coordinate is closest (by
+    /// squared Euclidean distance) to the click. Falls through to the
     /// raw click if the filtered view is empty or already contains it.
-    fn snap_to_nearest_filtered(&self, x: u32, y: u32) -> (u32, u32) {
-        if self.list.filtered_view.is_empty() || self.is_in_filtered((x, y)) {
-            return (x, y);
+    fn snap_to_nearest_filtered(&self, xy: PixelXY) -> PixelXY {
+        if self.list.filtered_view.is_empty() || self.is_in_filtered(xy) {
+            return xy;
         }
         (0..self.list.filtered_view.len())
             .filter_map(|i| self.filtered_xy(i))
-            .min_by_key(|&(px, py)| {
-                let dx = px as i64 - x as i64;
-                let dy = py as i64 - y as i64;
+            .min_by_key(|p| {
+                let dx = p.x as i64 - xy.x as i64;
+                let dy = p.y as i64 - xy.y as i64;
                 dx * dx + dy * dy
             })
-            .unwrap_or((x, y))
+            .unwrap_or(xy)
     }
 
     pub(super) fn reset_edit_state(&mut self) {
-        self.sel.pending_edit = None;
         self.sel.selected_edit = None;
         self.sel.edit_options.clear();
         self.sel.backref_src = None;
     }
 }
 
-// ── pure helpers ─────────────────────────────────────────────────────────────
+// pure helpers
 
 /// Binary-search a `PixelRow` slice sorted by `(y, x)` for the row at
-/// `(x, y)`. Both `pixel_index.lit` and `pixel_index.refs` are built in
+/// `xy`. Both `pixel_index.lit` and `pixel_index.refs` are built in
 /// raster order by [`crate::index::build_pixel_index`].
 #[inline]
-fn find_pixel_row(rows: &[PixelRow], x: u32, y: u32) -> Option<usize> {
-    rows.binary_search_by_key(&(y, x), |r| (r.y(), r.x())).ok()
+fn find_pixel_row(rows: &[PixelRow], xy: PixelXY) -> Option<usize> {
+    rows.binary_search_by_key(&(xy.y, xy.x), |r| (r.y(), r.x()))
+        .ok()
 }
 
-fn gather_pixel_events(c: &CoreData, base_raw: usize) -> Vec<(usize, usize)> {
-    (0..c.geom.bpp as usize)
+/// A byte of the clicked pixel and the event that produced it: `ch` is
+/// the channel byte offset within the pixel (`0..bpp`), `ev_idx` indexes
+/// [`CoreData::events`].
+#[derive(Debug, Clone, Copy)]
+struct ChannelEvent {
+    ch: usize,
+    ev_idx: usize,
+}
+
+fn gather_pixel_events(c: &CoreData, base_raw: usize) -> Vec<ChannelEvent> {
+    (0..c.info.bpp)
         .filter_map(|ch| {
             let pos = base_raw + ch;
-            event_at(&c.events, pos).map(|idx| (ch, idx as usize))
+            event_at(&c.events, pos).map(|idx| ChannelEvent {
+                ch,
+                ev_idx: idx as usize,
+            })
         })
         .collect()
 }
@@ -218,23 +235,23 @@ fn gather_pixel_events(c: &CoreData, base_raw: usize) -> Vec<(usize, usize)> {
 struct SelectionBuild {
     info_lines: Vec<String>,
     edit_options: Vec<EditOption>,
-    backref_src: Option<(u32, u32)>,
+    backref_src: Option<PixelXY>,
     cascade_positions: Vec<u32>,
 }
 
 fn build_selection_data(
     c: &CoreData,
-    evs: &[(usize, usize)],
-    sx: u32,
-    sy: u32,
+    evs: &[ChannelEvent],
+    sel: PixelXY,
     base_raw: usize,
 ) -> SelectionBuild {
+    let (sx, sy) = (sel.x, sel.y);
     // `pixel_index.lit` / `.refs` are sorted by `(y, x)` at build time,
     // so resolving the selected pixel's row in either array is one
     // `O(log N)` binary search rather than a linear scan.
     let idx_str = match (
-        find_pixel_row(&c.pixel_index.lit, sx, sy),
-        find_pixel_row(&c.pixel_index.refs, sx, sy),
+        find_pixel_row(&c.pixel_index.lit, sel),
+        find_pixel_row(&c.pixel_index.refs, sel),
     ) {
         (Some(i), _) => format!("  lit #{}", i + 1),
         (_, Some(i)) => format!("  ref #{}", i + 1),
@@ -246,41 +263,39 @@ fn build_selection_data(
     // they understand a "literal swap" here recolours the whole cluster.
     // At the right edge of the image the last cluster may be smaller
     // than `pixels_per_byte` (the trailing bits are padding).
-    let ppb = c.geom.pixels_per_byte();
+    let ppb = c.raster.pixels_per_byte();
     if ppb > 1 {
-        let cluster_end = (sx + ppb).min(c.geom.w);
+        let cluster_end = (sx + ppb).min(c.info.width);
         let cluster_size = cluster_end - sx;
         let last_x = cluster_end - 1;
         let plural = if cluster_size > 1 { "s" } else { "" };
         info_lines.push(format!(
-            "  (this byte encodes {cluster_size} pixel{plural} at y={sy}, x={sx}..{last_x} — edits affect all of them)"
+            "  (this byte encodes {cluster_size} pixel{plural} at y={sy}, x={sx}..{last_x}; edits affect all of them)"
         ));
     }
     let mut edit_options: Vec<EditOption> = Vec::new();
     let mut cascade_positions: Vec<u32> = Vec::new();
     // Grouped by (symbol, block) so one `EditOption` covers every channel
-    // sharing those — a pixel with all three RGB bytes literal-encoded
+    // sharing those: a pixel with all three RGB bytes literal-encoded
     // in the same block becomes a single "literal X → Y" row, not three.
     let mut lit_groups: HashMap<(u8, u32), Vec<LitPatchSite>> = HashMap::new();
     let mut backref_src = None;
 
-    for &(ch, ev_idx) in evs {
-        let ch_name = CH_NAMES.get(ch).copied().unwrap_or("?");
+    for &ChannelEvent { ch, ev_idx } in evs {
+        let ch_name = c.info.channel_label(ch);
+        let block = block_of(&c.block_starts, ev_idx as u32);
         match &c.events[ev_idx] {
             Event::Lit(lit) => {
                 cascade_positions.push(lit.out_pos);
-                let le = &c.lit_encs[lit.block as usize];
-                let (_, clen) = le.get(lit.symbol as u16).unwrap_or((0, 0));
-                let same_count = le
-                    .iter()
-                    .filter(|&(s, _, cl)| cl == clen && s < 256 && s != lit.symbol as u16)
-                    .count();
+                let le = &c.lit_encs[block as usize];
+                let clen = le.get(lit.symbol as u16).map_or(0, |c| c.len);
+                let same_count = same_len_lit_swaps(le, lit.symbol as u16).count();
                 info_lines.push(format!(
-                    "  {ch_name}: LITERAL  val={}  block={}  {clen}-bit  {same_count} swap options",
-                    lit.symbol, lit.block,
+                    "  {ch_name}: LITERAL  val={}  block={block}  {clen}-bit  {same_count} swap options",
+                    lit.symbol,
                 ));
                 lit_groups
-                    .entry((lit.symbol, lit.block))
+                    .entry((lit.symbol, block))
                     .or_default()
                     .push(LitPatchSite {
                         ch,
@@ -291,23 +306,20 @@ fn build_selection_data(
             Event::Ref(r) => {
                 cascade_positions.push(r.out_pos);
                 let dist = r.out_pos - r.src_out_pos;
-                let src_xy = c
-                    .geom
-                    .out_to_xy(OutPos(r.src_out_pos))
-                    .map(|xy| (xy.x, xy.y));
+                let src_xy = c.raster.out_to_xy(OutPos(r.src_out_pos));
                 if backref_src.is_none() {
                     backref_src = src_xy;
                 }
+                let from = src_xy.map(|p| (p.x, p.y));
                 let alts =
-                    valid_dist_alts(r.block, r.dist_sym, r.out_pos, r.src_out_pos, &c.dist_encs);
+                    valid_dist_alts(block, r.dist_sym, r.out_pos, r.src_out_pos, &c.dist_encs);
                 info_lines.push(format!(
-                    "  {ch_name}: BACKREF  val={}  block={}  from={src_xy:?}  dist={dist}  len={}  {} redirect options",
+                    "  {ch_name}: BACKREF  val={}  block={block}  from={from:?}  dist={dist}  len={}  {} redirect options",
                     c.output.get(base_raw + ch).copied().unwrap_or(0),
-                    r.block,
                     r.copy_len,
                     alts.len(),
                 ));
-                edit_options.extend(build_ref_redirect_edits(c, r, ch_name, &alts));
+                edit_options.extend(build_ref_redirect_edits(c, r, block, &ch_name, &alts));
             }
         }
     }
@@ -325,23 +337,32 @@ fn build_selection_data(
 fn build_ref_redirect_edits(
     c: &CoreData,
     r: &RefEvent,
+    block: u32,
     ch_name: &str,
     alts: &[(u8, u32, u32)],
 ) -> Vec<EditOption> {
-    let de = &c.dist_encs[r.block as usize];
-    let (_, old_len) = de.get(r.dist_sym as u16).unwrap_or((0, 0));
+    let de = &c.dist_encs[block as usize];
+    let old_len = de.get(r.dist_sym as u16).map_or(0, |c| c.len);
     let dist = r.out_pos - r.src_out_pos;
 
     alts.iter()
         .filter_map(|&(new_dsym, new_src, new_dist)| {
-            let (new_code, new_len) = de.get(new_dsym as u16).unwrap_or((0, 0));
+            let SymCode {
+                code: new_code,
+                len: new_len,
+            } = de.get(new_dsym as u16).unwrap_or_default();
             if new_len != old_len {
                 return None;
             }
-            let src_xy2 = c.geom.out_to_xy(OutPos(new_src)).map(|xy| (xy.x, xy.y));
+            let src_xy2 = c.raster.out_to_xy(OutPos(new_src)).map(|xy| (xy.x, xy.y));
             let new_src_us = new_src as usize;
-            let preview: Vec<u8> = (0..c.geom.bpp as usize)
-                .filter_map(|i| c.output.get(new_src_us + i).copied())
+            // One representative byte per channel: the high byte at
+            // 16-bit (which is what `to_rgba8` displays), the whole byte
+            // at 8-bit. Sampling `0..bpp` raw would splice a 16-bit R's
+            // low byte in as "G".
+            let bytes_per_sample = (c.info.bit_depth.max(8) / 8) as usize;
+            let preview: Vec<u8> = (0..c.info.color_type.channels() as usize)
+                .filter_map(|chan| c.output.get(new_src_us + chan * bytes_per_sample).copied())
                 .collect();
             let label = format!(
                 "[{ch_name}] REDIRECT  dist {dist} → {new_dist}  src {src_xy2:?}  val≈{preview:?}"
@@ -370,7 +391,7 @@ fn build_ref_redirect_edits(
         .collect()
 }
 
-/// RGB swatch for a distance redirect's target pixel — falls back to grey
+/// RGB swatch for a distance redirect's target pixel; falls back to grey
 /// of the channel average when fewer than 3 channels are available.
 fn preview_color(preview: &[u8]) -> Color32 {
     let avg = if preview.is_empty() {
@@ -385,6 +406,16 @@ fn preview_color(preview: &[u8]) -> Color32 {
     )
 }
 
+/// Literal symbols in `le` that share `val`'s Huffman code length (so
+/// swapping one in keeps the bitstream length unchanged), excluding `val`
+/// itself. The single source of the same-length-swap rule for literals.
+fn same_len_lit_swaps(le: &EncTable, val: u16) -> impl Iterator<Item = u16> + '_ {
+    let clen = le.get(val).map_or(0, |c| c.len);
+    le.iter()
+        .filter(move |&(s, sc)| sc.len == clen && s < 256 && s != val)
+        .map(|(s, _)| s)
+}
+
 fn build_lit_swap_edits(
     c: &CoreData,
     lit_groups: &HashMap<(u8, u32), Vec<LitPatchSite>>,
@@ -392,20 +423,19 @@ fn build_lit_swap_edits(
     let mut out = Vec::new();
     for ((val, blk), sites) in lit_groups {
         let le = &c.lit_encs[*blk as usize];
-        let (_, clen) = le.get(*val as u16).unwrap_or((0, 0));
-        let mut swappable: Vec<u16> = le
-            .iter()
-            .filter(|&(s, _, cl)| cl == clen && s < 256 && s != *val as u16)
-            .map(|(s, _, _)| s)
-            .collect();
+        let clen = le.get(*val as u16).map_or(0, |c| c.len);
+        let mut swappable: Vec<u16> = same_len_lit_swaps(le, *val as u16).collect();
         swappable.sort();
         let chs: String = sites
             .iter()
-            .map(|s| CH_NAMES.get(s.ch).copied().unwrap_or("?"))
+            .map(|s| c.info.channel_label(s.ch))
             .collect::<Vec<_>>()
             .join(",");
         for tgt in swappable {
-            let (new_code, new_len) = le.get(tgt).unwrap_or((0, 0));
+            let SymCode {
+                code: new_code,
+                len: new_len,
+            } = le.get(tgt).unwrap_or_default();
             let label = format!("[{chs}] LITERAL  {val} → {tgt}  (both {clen}-bit)");
             let bg = Color32::from_gray(tgt as u8);
             let fg = Color32::from_gray(255u8.saturating_sub(tgt as u8));
@@ -417,8 +447,13 @@ fn build_lit_swap_edits(
                     code_len: new_len,
                 })
                 .collect();
-            let byte_updates: Vec<(u32, u8)> =
-                sites.iter().map(|s| (s.out_pos, tgt as u8)).collect();
+            let byte_updates: Vec<ByteWrite> = sites
+                .iter()
+                .map(|s| ByteWrite {
+                    out_pos: s.out_pos,
+                    value: tgt as u8,
+                })
+                .collect();
             out.push(EditOption {
                 label,
                 bg_color: bg,
@@ -454,9 +489,9 @@ fn compute_cascade_for_pixel(
     positions: &[u32],
 ) -> CascadeSummary {
     let cascade = scratch.run(positions, &c.reverse_graph);
-    let filter = compute_filter_expansion(cascade.affected, &c.output, &c.geom);
+    let filter = compute_filter_expansion(cascade.affected, &c.output, &c.info);
     // Skip per-row PNG filter bytes when reporting affected count.
-    let row_stride = c.geom.row_stride as usize;
+    let row_stride = c.info.row_stride;
     let n_affected = cascade
         .affected
         .iter()
@@ -464,10 +499,10 @@ fn compute_cascade_for_pixel(
         .count();
     let n_filter: u32 = filter
         .iter()
-        .map(|(_, mx)| c.geom.w.saturating_sub(mx))
+        .map(|(_, mx)| c.info.width.saturating_sub(mx))
         .sum();
     let max_depth = cascade.max_depth;
-    let overlay = make_cascade_overlay_bytes(&cascade, &filter, &c.geom);
+    let overlay = make_cascade_overlay_bytes(&cascade, &filter, &c.info);
     CascadeSummary {
         overlay,
         text: format!(

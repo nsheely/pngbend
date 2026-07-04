@@ -140,8 +140,8 @@ impl PngBendApp {
                 )
             }
             PixelType::Ref => {
-                // Every entry in `refs` is editable by construction —
-                // `build_pixel_index` filters out non-redirectable refs —
+                // Every entry in `refs` is editable by construction
+                // (`build_pixel_index` filters out non-redirectable refs),
                 // so an "(N editable)" suffix here would always read "of N".
                 let n = c.pixel_index.refs.len();
                 (n, format!("Backrefs: {n}"))
@@ -258,16 +258,14 @@ impl PngBendApp {
                     .interact(egui::Sense::click());
 
                 if response.clicked() {
-                    let (nx, ny) = row.xy();
-                    self.select_pixel(nx, ny, SelectSource::Refocus);
+                    self.select_pixel(row.xy(), SelectSource::Refocus);
                     self.view.texture_dirty = true;
                 }
             }
         });
     }
 
-    /// Returns which buttons were clicked this frame — the caller acts on
-    /// them after the panel closure has released its borrow of `self`.
+    /// Returns which buttons were clicked this frame.
     pub(in crate::app) fn ui_right_panel(&mut self, ui: &mut egui::Ui) -> RightPanelClicks {
         let mut clicks = RightPanelClicks::default();
         egui::Panel::right("right_panel")
@@ -303,12 +301,10 @@ impl PngBendApp {
     fn ui_pixel_info(&self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.label("Pixel info (click image):");
-            // Bi-directional scroll: the channel-detail lines run wider
-            // than the 340 px panel (e.g. "R: LITERAL val=255 block=3
-            // 9-bit  4 swap options" at the default monospace size).
-            // Vertical-only + wrap would mid-break those lines and
-            // shuffle the columns out of alignment, so we let them
-            // extend and provide horizontal scroll instead.
+            // Bi-directional scroll: channel-detail lines run wider than
+            // the 340 px panel. Vertical-only + wrap would mid-break them
+            // and shuffle the columns out of alignment, so we let them
+            // extend and scroll horizontally instead.
             egui::ScrollArea::both()
                 .id_salt("info_scroll")
                 .max_height(150.0)
@@ -368,7 +364,6 @@ impl PngBendApp {
 
                         if r.clicked() {
                             self.sel.selected_edit = Some(i);
-                            self.sel.pending_edit = Some(self.sel.edit_options[i].action.clone());
                             self.status = format!("Selected: {label}");
                         }
                     }
@@ -378,7 +373,7 @@ impl PngBendApp {
 
     fn ui_action_buttons(&self, ui: &mut egui::Ui, clicks: &mut RightPanelClicks) {
         ui.horizontal(|ui| {
-            clicks.apply = enabled_button(ui, self.sel.pending_edit.is_some(), "Apply");
+            clicks.apply = enabled_button(ui, self.sel.selected_edit.is_some(), "Apply");
             clicks.undo = enabled_button(ui, self.doc.history.can_undo(), "Undo");
             clicks.save = enabled_button(ui, self.doc.core.is_some(), "Save PNG…");
         });

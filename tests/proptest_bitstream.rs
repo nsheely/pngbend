@@ -1,8 +1,7 @@
 //! Property tests for the bit-level read/write functions.
 //!
-//! Covers every bit width (1..=32), every byte-aligned and unaligned
-//! offset, and arbitrary values — if a bit-packing change ever breaks
-//! round-trip, these catch it.
+//! Cover every bit width (1..=32), aligned and unaligned offsets, and
+//! arbitrary values, catching any bit-packing round-trip regression.
 
 use pngbend::bitstream::{BitReader, read_bits_at, write_bits};
 use proptest::prelude::*;
@@ -18,7 +17,7 @@ proptest! {
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         let v = value & mask;
 
-        // Buffer large enough to hold (offset + n) bits plus generous padding.
+        // Buffer holds (offset + n) bits plus padding.
         let mut buf = vec![0u8; (offset + n as usize) / 8 + 8];
         write_bits(&mut buf, offset, v, n);
 
@@ -40,9 +39,9 @@ proptest! {
                 break;
             }
             let reader_val = reader.read_bits(n);
-            // read_bits_at uses the MSB-first interpretation used by write_bits.
-            // BitReader reads bits LSB-first within bytes. To cross-check, we
-            // reverse the bit order of read_bits_at's result over n bits.
+            // read_bits_at is MSB-first (like write_bits); BitReader is
+            // LSB-first within bytes. Reverse read_bits_at's result over
+            // n bits to cross-check.
             let at_val = read_bits_at(&bytes, offset, n as u8);
             let at_val_lsb_first = reverse_bits(at_val, n as u8);
             prop_assert_eq!(reader_val, at_val_lsb_first);

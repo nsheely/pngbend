@@ -1,13 +1,15 @@
-//! End-to-end test: load a real PNG, decode its IDAT stream, and verify the
+//! End-to-end tests: load a real PNG, decode its IDAT stream, verify the
 //! library's public surface produces sensible output.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use pngbend::bitstream::{read_bits_at, write_bits};
-use pngbend::deflate::{Event, decode_deflate};
+use pngbend::deflate::{Event, block_of, decode_deflate, inflate};
 use pngbend::index::{build_pos_to_ev, build_reverse_graph, valid_dist_alts};
-use pngbend::png::{concat_idat, parse_ihdr, read_chunks, unfilter, unfilter_rows_into};
+use pngbend::png::{
+    ChunkType, Warning, concat_idat, parse_ihdr, read_chunks, unfilter, unfilter_rows_into,
+};
 
 fn sample_path() -> PathBuf {
     let manifest =
@@ -17,9 +19,8 @@ fn sample_path() -> PathBuf {
         .join("checksum_sunset.png")
 }
 
-/// Read the integration-test sample, or skip the test cleanly if it isn't
-/// on disk. Lets `cargo test` pass on a fresh clone without samples — the
-/// per-test logic still runs whenever a sample is present.
+/// Read the integration-test sample, or skip cleanly if it isn't on
+/// disk, so `cargo test` passes on a fresh clone without samples.
 fn read_sample_or_skip(test_name: &str) -> Option<Vec<u8>> {
     let path = sample_path();
     match std::fs::read(&path) {
@@ -40,14 +41,14 @@ fn loads_sample_png_end_to_end() {
         return;
     };
 
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     assert!(!chunks.is_empty(), "no PNG chunks parsed");
     assert!(
-        chunks.iter().any(|c| &c.typ == b"IHDR"),
+        chunks.iter().any(|c| c.typ == ChunkType::IHDR),
         "no IHDR chunk found"
     );
     assert!(
-        chunks.iter().any(|c| &c.typ == b"IDAT"),
+        chunks.iter().any(|c| c.typ == ChunkType::IDAT),
         "no IDAT chunk found"
     );
 
@@ -67,9 +68,10 @@ fn loads_sample_png_end_to_end() {
         expected_min,
         "output length should equal h * (1 + w*bpp)"
     );
-    assert!(decoded.num_blocks >= 1);
-    assert_eq!(decoded.lit_encs.len(), decoded.num_blocks);
-    assert_eq!(decoded.dist_encs.len(), decoded.num_blocks);
+    assert!(decoded.num_blocks() >= 1);
+    // One lit/dist encoder table per block, so the two lengths agree
+    // with each other and num_blocks() by construction.
+    assert_eq!(decoded.lit_encs.len(), decoded.dist_encs.len());
 
     let lit_count = decoded
         .events
@@ -82,8 +84,8 @@ fn loads_sample_png_end_to_end() {
         .filter(|e| matches!(e, Event::Ref(_)))
         .count();
     assert!(lit_count > 0, "expected at least one literal event");
-    // A typical photo PNG is highly back-referenced; at least one Ref is
-    // a sane lower bound for a real-world sample.
+    // A photo PNG is heavily back-referenced; ≥1 Ref is a sane lower
+    // bound for a real sample.
     assert!(ref_count > 0, "expected at least one back-ref event");
 
     // pos_to_ev and reverse_graph should also build cleanly.
@@ -94,9 +96,30 @@ fn loads_sample_png_end_to_end() {
     assert_eq!(rev.len(), decoded.output.len());
 }
 
+/// The event-free `inflate` fast path and the recording `decode_deflate`
+/// share one decode core, so on a real dynamic-Huffman + back-reference
+/// stream they must produce byte-identical output. Guards the two paths
+/// against drift.
+#[test]
+fn inflate_matches_decode_deflate_on_real_stream() {
+    let Some(raw) = read_sample_or_skip("inflate_matches_decode_deflate_on_real_stream") else {
+        return;
+    };
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
+    let idat = concat_idat(&chunks);
+    let deflate = &idat[2..idat.len() - 4];
+
+    let full = decode_deflate(deflate, None).expect("decode_deflate");
+    let lean = inflate(deflate, None).expect("inflate");
+    assert_eq!(
+        lean, full.output,
+        "event-free inflate must byte-match the recording decoder"
+    );
+}
+
 #[test]
 fn malformed_deflate_returns_error_not_panic() {
-    // 3 bytes of all-ones — not a valid deflate stream.
+    // 3 bytes of all-ones, not a valid deflate stream.
     let garbage = vec![0xFFu8; 3];
     let result = decode_deflate(&garbage, None);
     assert!(result.is_err(), "expected an error from corrupt deflate");
@@ -105,8 +128,8 @@ fn malformed_deflate_returns_error_not_panic() {
 #[test]
 fn crc_corrupted_png_loads_with_warning() {
     // Glitcher's contract: a PNG whose chunk CRCs aren't refreshed must
-    // still load. Flip a bit in the IHDR CRC of a real sample and
-    // verify read_chunks reports a warning instead of failing.
+    // still load. Flip a bit in a real sample's IHDR CRC; read_chunks
+    // must warn, not fail.
     let Some(mut raw) = read_sample_or_skip("crc_corrupted_png_loads_with_warning") else {
         return;
     };
@@ -115,21 +138,22 @@ fn crc_corrupted_png_loads_with_warning() {
     raw[29] ^= 0x80;
     let parsed = read_chunks(&raw).expect("CRC mismatch must not fail the parse");
     assert!(
-        parsed.warnings.iter().any(|w| w.contains("IHDR")),
+        parsed
+            .warnings
+            .iter()
+            .any(|w| matches!(w, Warning::ChunkCrc { typ } if *typ == ChunkType::IHDR)),
         "expected an IHDR CRC warning, got {:?}",
         parsed.warnings
     );
-    let info = parse_ihdr(&parsed).expect("IHDR data still parses");
+    let info = parse_ihdr(&parsed.chunks).expect("IHDR data still parses");
     assert!(info.width > 0 && info.height > 0);
 }
 
-/// Save round-trip: rebuild a PNG by replacing IDAT with a freshly
-/// constructed zlib stream and re-emitting every chunk via
-/// `write_chunks`. The saved bytes must re-read to the same decoded
-/// output as the original. Covers the end-to-end save path
-/// (`build_zlib_stream` + IDAT replacement + `write_chunks` + CRC) that
-/// the unit tests check piecewise but no other integration test
-/// exercises as a whole.
+/// Save round-trip: rebuild a PNG by replacing IDAT with a fresh zlib
+/// stream and re-emitting every chunk via `write_chunks`. The saved
+/// bytes must re-read to the same decoded output as the original. Covers
+/// the end-to-end save path (`build_zlib_stream` + IDAT replacement +
+/// `write_chunks` + CRC) that unit tests check only piecewise.
 #[test]
 fn save_and_reread_unedited_png_round_trips() {
     use pngbend::png::{Chunk, build_zlib_stream, write_chunks};
@@ -137,7 +161,7 @@ fn save_and_reread_unedited_png_round_trips() {
     let Some(raw) = read_sample_or_skip("save_and_reread_unedited_png_round_trips") else {
         return;
     };
-    let chunks_orig = read_chunks(&raw).expect("read chunks");
+    let chunks_orig = read_chunks(&raw).expect("read chunks").chunks;
     let info = parse_ihdr(&chunks_orig).expect("parse IHDR");
     let idat = concat_idat(&chunks_orig);
     let zlib_header = [idat[0], idat[1]];
@@ -146,17 +170,17 @@ fn save_and_reread_unedited_png_round_trips() {
 
     // Same shape as `app::edit::PngBendApp::assemble_png_bytes`: collapse
     // every IDAT into one rebuilt entry, copy other chunks through.
-    let zlib = build_zlib_stream(&deflate_buf, &zlib_header, &decoded.output);
+    let zlib = build_zlib_stream(&deflate_buf, zlib_header, &decoded.output);
     let out_chunks: Vec<Chunk> = chunks_orig
         .iter()
         .scan(false, |seen, c| {
-            if &c.typ == b"IDAT" {
+            if c.typ == ChunkType::IDAT {
                 if *seen {
                     return Some(None);
                 }
                 *seen = true;
                 Some(Some(Chunk {
-                    typ: *b"IDAT",
+                    typ: ChunkType::IDAT,
                     data: zlib.clone(),
                 }))
             } else {
@@ -170,10 +194,9 @@ fn save_and_reread_unedited_png_round_trips() {
         .collect();
     let saved = write_chunks(&out_chunks);
 
-    // Re-read the saved bytes and decode again. The output bytes must
-    // match the original — anything else means the save chain dropped
-    // or corrupted something.
-    let chunks_re = read_chunks(&saved).expect("read saved chunks");
+    // Re-read and decode the saved bytes. Output must match the
+    // original; anything else means the save chain corrupted something.
+    let chunks_re = read_chunks(&saved).expect("read saved chunks").chunks;
     let info_re = parse_ihdr(&chunks_re).expect("re-parse IHDR");
     assert_eq!(info_re.width, info.width);
     assert_eq!(info_re.height, info.height);
@@ -190,18 +213,18 @@ fn save_and_reread_unedited_png_round_trips() {
 
 /// The fast path in `app::edit::apply_literal_swap_incremental` assumes
 /// that patching `output[lit.out_pos]` to the new symbol and propagating
-/// that byte through every `reverse_graph` descendant yields the same
-/// bytes as re-running `decode_deflate` on the patched bit stream.
+/// it through every `reverse_graph` descendant yields the same bytes as
+/// re-decoding the patched bit stream.
 ///
-/// This is load-bearing — if the assumption ever breaks, edits silently
-/// corrupt the rendered image. So we build the full incremental state
-/// and compare it byte-for-byte against a fresh decode.
+/// Load-bearing: if the assumption breaks, edits silently corrupt the
+/// render. Build the full incremental state and compare byte-for-byte
+/// against a fresh decode.
 #[test]
 fn incremental_literal_swap_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("incremental_literal_swap_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
@@ -212,13 +235,15 @@ fn incremental_literal_swap_matches_full_decode() {
     let (swap_bit, swap_len, new_code, out_pos, new_symbol) = decoded
         .events
         .iter()
-        .find_map(|e| match e {
+        .enumerate()
+        .find_map(|(i, e)| match e {
             Event::Lit(lit) => {
-                let le = &decoded.lit_encs[lit.block as usize];
-                let (_, cur_clen) = le.get(lit.symbol as u16)?;
+                let block = block_of(&decoded.block_starts, i as u32);
+                let le = &decoded.lit_encs[block as usize];
+                let cur_clen = le.get(lit.symbol as u16)?.len;
                 le.iter()
-                    .find(|(s, _, clen)| *s < 256 && *s != lit.symbol as u16 && *clen == cur_clen)
-                    .map(|(sym, code, _)| (lit.bit_start, cur_clen, code, lit.out_pos, sym as u8))
+                    .find(|(s, sc)| *s < 256 && *s != lit.symbol as u16 && sc.len == cur_clen)
+                    .map(|(sym, sc)| (lit.bit_start, cur_clen, sc.code, lit.out_pos, sym as u8))
             }
             _ => None,
         })
@@ -232,8 +257,8 @@ fn incremental_literal_swap_matches_full_decode() {
         swap_len,
     );
 
-    // Incremental path: patch the one output byte, then propagate via
-    // reverse_graph just like `apply_literal_swap_incremental` does.
+    // Incremental path: patch the one output byte, propagate via
+    // reverse_graph as `apply_literal_swap_incremental` does.
     let mut incremental = decoded.output.clone();
     incremental[out_pos as usize] = new_symbol;
     let mut frontier: VecDeque<u32> = VecDeque::new();
@@ -255,7 +280,7 @@ fn incremental_literal_swap_matches_full_decode() {
         reference.len(),
         "lengths must match after a same-length literal swap"
     );
-    // Find the first mismatch if any, for a useful failure message.
+    // Report the first mismatch for a useful failure message.
     for (i, (a, b)) in incremental.iter().zip(reference.iter()).enumerate() {
         assert_eq!(
             a, b,
@@ -264,55 +289,55 @@ fn incremental_literal_swap_matches_full_decode() {
     }
 }
 
-/// The row-scoped unfilter that the redirect path runs (in
-/// `app::edit::apply_dist_redirect_incremental`'s step 6) reuses the
-/// pre-edit `unfiltered` buffer for every row outside the diff range.
-/// That's correct iff `unfilter_rows_into` chains through filter-2/3/4
-/// downstream rows — those filter types read the prior row, so a
-/// silently-skipped row leaves every later pixel drifted. This test
-/// compares the row-scoped result against a full from-scratch unfilter
-/// of the post-edit output.
+/// The row-scoped unfilter in `apply_dist_redirect_incremental`'s step 6
+/// reuses the pre-edit `unfiltered` buffer for every row outside the
+/// diff range. Correct iff `unfilter_rows_into` chains through
+/// filter-2/3/4 downstream rows, which read the prior row: a skipped row
+/// would drift every later pixel. Compares the row-scoped result against
+/// a full from-scratch unfilter of the post-edit output.
 #[test]
 fn incremental_redirect_unfilter_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("incremental_redirect_unfilter_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     let info = parse_ihdr(&chunks).expect("ihdr");
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
     let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
 
-    // Find a back-ref with at least one valid redirect target via the
-    // same helper the app uses, then grab the new Huffman code out of
-    // the dist EncTable.
+    // Find a back-ref with a valid redirect target via the app's helper,
+    // then grab the new Huffman code from the dist EncTable.
     let (swap_bit, swap_len, new_code, affected_from) = decoded
         .events
         .iter()
-        .find_map(|e| match e {
+        .enumerate()
+        .find_map(|(i, e)| match e {
             Event::Ref(r) => {
+                let block = block_of(&decoded.block_starts, i as u32);
                 let alts = valid_dist_alts(
-                    r.block,
+                    block,
                     r.dist_sym,
                     r.out_pos,
                     r.src_out_pos,
                     &decoded.dist_encs,
                 );
                 let &(new_sym, _new_src, _new_dist) = alts.first()?;
-                let de = &decoded.dist_encs[r.block as usize];
-                let (new_code, new_clen) = de.get(new_sym as u16)?;
+                let de = &decoded.dist_encs[block as usize];
+                let sc = de.get(new_sym as u16)?;
+                let (new_code, new_clen) = (sc.code, sc.len);
                 Some((r.dist_bit_start, new_clen, new_code, r.out_pos))
             }
             _ => None,
         })
         .expect("no redirect candidate in sample");
 
-    // Full unfilter of the *pre-edit* output — this is what `CoreData`
-    // holds across edits, and what the redirect path reuses.
+    // Full unfilter of the *pre-edit* output: what `CoreData` holds
+    // across edits and the redirect path reuses.
     let mut unfiltered_cache = unfilter(&decoded.output, &info).expect("initial unfilter");
 
-    // Apply the redirect patch, re-decode — this is the new reference.
+    // Apply the redirect patch and re-decode: the new reference.
     write_bits(
         &mut deflate_buf,
         swap_bit as usize,
@@ -322,9 +347,9 @@ fn incremental_redirect_unfilter_matches_full_decode() {
     let decoded_after = decode_deflate(&deflate_buf, None).expect("decode after redirect");
     let reference = unfilter(&decoded_after.output, &info).expect("reference unfilter");
 
-    // Incremental: diff old vs new output starting at `affected_from`,
-    // then call `unfilter_rows_into` with the diffed row range — the
-    // same shape `apply_dist_redirect_incremental` produces.
+    // Incremental: diff old vs new output from `affected_from`, then
+    // `unfilter_rows_into` over the diffed row range, the shape
+    // `apply_dist_redirect_incremental` produces.
     let old_output = decoded.output;
     let new_output = &decoded_after.output;
     let row_stride = info.row_stride;
@@ -368,49 +393,49 @@ fn incremental_redirect_unfilter_matches_full_decode() {
     }
 }
 
-/// The undo invariant the entire history stack rests on: applying N edits
-/// to `deflate_buf` then undoing them in reverse must restore it byte-for-
-/// byte. The proptest in `app::edit::tests::forward_then_inverse_restores_buffer`
-/// covers the bit-level primitive on synthetic inputs; this test exercises
-/// the same primitive on a real PNG's deflate stream against patches built
-/// from real `EncTable`s — the path that actually runs in the editor.
+/// The undo invariant the history stack rests on: applying N edits to
+/// `deflate_buf` then undoing in reverse must restore it byte-for-byte.
+/// `app::edit::tests::forward_then_inverse_restores_buffer` covers the
+/// bit-level primitive on synthetic inputs; this exercises it on a real
+/// PNG's deflate stream with patches built from real `EncTable`s, the
+/// path that runs in the editor.
 #[test]
 fn apply_then_undo_n_literal_swaps_restores_deflate_buf() {
     let Some(raw) = read_sample_or_skip("apply_then_undo_n_literal_swaps_restores_deflate_buf")
     else {
         return;
     };
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     let idat = concat_idat(&chunks);
     let original_deflate = idat[2..idat.len() - 4].to_vec();
     let mut deflate_buf = original_deflate.clone();
 
     let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
 
-    // Pick the first 4 swappable literals — distinct events with same-
-    // length Huffman alternatives. Mirrors `find_literal_swaps` in the
-    // profile binary.
+    // First 4 swappable literals: distinct events with same-length
+    // Huffman alternatives. Mirrors `find_literal_swaps` in profile.rs.
     let swaps: Vec<(u32, u8, u16)> = decoded
         .events
         .iter()
-        .filter_map(|e| {
+        .enumerate()
+        .filter_map(|(i, e)| {
             let Event::Lit(lit) = e else { return None };
-            let le = &decoded.lit_encs[lit.block as usize];
-            let (_, cur_clen) = le.get(lit.symbol as u16)?;
-            let (_, new_code, _) = le
+            let block = block_of(&decoded.block_starts, i as u32);
+            let le = &decoded.lit_encs[block as usize];
+            let cur_clen = le.get(lit.symbol as u16)?.len;
+            let (_, new) = le
                 .iter()
-                .find(|(s, _, clen)| *s < 256 && *s != lit.symbol as u16 && *clen == cur_clen)?;
-            Some((lit.bit_start, cur_clen, new_code))
+                .find(|(s, sc)| *s < 256 && *s != lit.symbol as u16 && sc.len == cur_clen)?;
+            Some((lit.bit_start, cur_clen, new.code))
         })
         .take(4)
         .collect();
     assert_eq!(swaps.len(), 4, "expected ≥ 4 swappable literals in sample");
 
-    // Forward: apply each swap, capturing the bits we overwrote so we can
-    // put them back. Order matters when patches overlap, but consecutive
-    // literal swaps in the same stream don't (each has a unique
-    // `bit_start`); we still record + replay LIFO to mirror the undo
-    // stack's invariant.
+    // Forward: apply each swap, capturing overwritten bits to restore
+    // later. Order matters only for overlapping patches; consecutive
+    // literal swaps don't overlap (unique `bit_start`), but we still
+    // record + replay LIFO to mirror the undo stack's invariant.
     let mut undo_stack: Vec<(u32, u32, u8)> = Vec::with_capacity(swaps.len());
     for &(bit, code_len, new_code) in &swaps {
         let bs = bit as usize;
@@ -434,44 +459,46 @@ fn apply_then_undo_n_literal_swaps_restores_deflate_buf() {
     );
 }
 
-/// State-equivalence test for the new surgical-redirect path.
+/// State-equivalence test for the surgical-redirect path.
 ///
 /// `apply_dist_redirect_incremental` skips `decode_deflate` and updates
-/// `output` via "recopy from new src + propagate via reverse_graph". This
-/// must produce the same `output` bytes that a fresh `decode_deflate`
-/// would on the patched bit stream — otherwise downstream renders silently
-/// drift. The redirect is the surgical analogue of the literal-swap path
-/// that `incremental_literal_swap_matches_full_decode` already covers.
+/// `output` via "recopy from new src + propagate via reverse_graph". It
+/// must produce the same `output` bytes a fresh `decode_deflate` would on
+/// the patched bit stream, else downstream renders drift. The surgical
+/// analogue of the literal-swap path
+/// `incremental_literal_swap_matches_full_decode` covers.
 #[test]
 fn surgical_redirect_output_matches_full_decode() {
     let Some(raw) = read_sample_or_skip("surgical_redirect_output_matches_full_decode") else {
         return;
     };
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     let idat = concat_idat(&chunks);
     let mut deflate_buf = idat[2..idat.len() - 4].to_vec();
 
     let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
     let reverse_graph = build_reverse_graph(&decoded.events, decoded.output.len());
 
-    // Find a back-ref with a redirect target. Same pattern as the
-    // existing redirect test, with the additional payload we need to
-    // mimic the surgical path (out_pos, copy_len, new_src).
+    // Find a back-ref with a redirect target, plus the payload the
+    // surgical path needs (out_pos, copy_len, new_src).
     let (swap_bit, swap_len, new_code, out_pos, copy_len, new_src) = decoded
         .events
         .iter()
-        .find_map(|e| match e {
+        .enumerate()
+        .find_map(|(i, e)| match e {
             Event::Ref(r) => {
+                let block = block_of(&decoded.block_starts, i as u32);
                 let alts = valid_dist_alts(
-                    r.block,
+                    block,
                     r.dist_sym,
                     r.out_pos,
                     r.src_out_pos,
                     &decoded.dist_encs,
                 );
                 let &(new_sym, new_src, _new_dist) = alts.first()?;
-                let de = &decoded.dist_encs[r.block as usize];
-                let (new_code, new_clen) = de.get(new_sym as u16)?;
+                let de = &decoded.dist_encs[block as usize];
+                let sc = de.get(new_sym as u16)?;
+                let (new_code, new_clen) = (sc.code, sc.len);
                 Some((
                     r.dist_bit_start as usize,
                     new_clen,
@@ -503,7 +530,7 @@ fn surgical_redirect_output_matches_full_decode() {
         }
     }
 
-    // Authoritative: patch the bitstream + decode from scratch.
+    // Authoritative: patch the bitstream and decode from scratch.
     write_bits(&mut deflate_buf, swap_bit, new_code as u32, swap_len);
     let reference = decode_deflate(&deflate_buf, None)
         .expect("patched stream should still decode (same-clen redirect)")
@@ -525,40 +552,39 @@ fn surgical_redirect_output_matches_full_decode() {
 /// Regression test for the surgical-redirect overlap bug.
 ///
 /// LZ77 allows refs whose source range OVERLAPS the destination
-/// (`src + copy_len > out_pos`) — that's how the format encodes
-/// run-length patterns. For an overlap ref, `events[i]`'s reverse-graph
-/// edges include positions inside `[out_pos, out_pos+copy_len)` as
-/// *sources*. When a redirect moves `src`, those intra-destination
-/// edges shift; a BFS that walks them on the **pre-rebuild** graph
-/// overwrites correctly recopied bytes with stale values.
+/// (`src + copy_len > out_pos`), encoding run-length patterns. For an
+/// overlap ref, `events[i]`'s reverse-graph edges include positions
+/// inside `[out_pos, out_pos+copy_len)` as *sources*. When a redirect
+/// moves `src`, those intra-destination edges shift; a BFS walking them
+/// on the **pre-rebuild** graph overwrites correctly recopied bytes with
+/// stale values.
 ///
-/// This was caught by a user noticing `apply → undo` produced a
-/// different glitch than the original edit. The non-overlap test
-/// `surgical_redirect_output_matches_full_decode` missed it because
-/// its first-redirect-candidate happened to be non-overlap.
+/// Surfaces as `apply`/`undo` producing a different glitch than the
+/// original edit. `surgical_redirect_output_matches_full_decode` misses
+/// it because its first redirect candidate is non-overlap.
 #[test]
 fn surgical_redirect_apply_undo_round_trip_with_overlap() {
     let Some(raw) = read_sample_or_skip("surgical_redirect_apply_undo_round_trip_with_overlap")
     else {
         return;
     };
-    let chunks = read_chunks(&raw).expect("read chunks");
+    let chunks = read_chunks(&raw).expect("read chunks").chunks;
     let idat = concat_idat(&chunks);
     let deflate_buf = idat[2..idat.len() - 4].to_vec();
     let decoded = decode_deflate(&deflate_buf, None).expect("initial decode");
     let original_output = decoded.output.clone();
 
-    // Find a redirect target where the ref OVERLAPS its destination —
-    // i.e. `src_out_pos + copy_len > out_pos`. Those are the cases the
-    // bug shows up on.
+    // Find a redirect target where the ref OVERLAPS its destination
+    // (`src_out_pos + copy_len > out_pos`): the cases the bug shows on.
     let target = decoded
         .events
         .iter()
         .enumerate()
         .find_map(|(idx, e)| match e {
             Event::Ref(r) if r.src_out_pos as usize + r.copy_len as usize > r.out_pos as usize => {
+                let block = block_of(&decoded.block_starts, idx as u32);
                 let alts = valid_dist_alts(
-                    r.block,
+                    block,
                     r.dist_sym,
                     r.out_pos,
                     r.src_out_pos,
@@ -576,8 +602,8 @@ fn surgical_redirect_apply_undo_round_trip_with_overlap() {
             _ => None,
         });
     let Some((event_idx, out_pos, copy_len, src_orig, new_src)) = target else {
-        // No overlap candidate in this sample — test trivially passes.
-        // The non-overlap path is covered by the other test.
+        // No overlap candidate in this sample: trivially pass. The
+        // non-overlap path is covered by the other test.
         return;
     };
 
@@ -585,10 +611,10 @@ fn surgical_redirect_apply_undo_round_trip_with_overlap() {
     let mut events = decoded.events.clone();
     let mut rev = build_reverse_graph(&events, output.len());
 
-    // Mirrors the fixed `apply_dist_redirect_incremental` order:
-    //   mutate event → rebuild rev → recopy → BFS over fresh rev.
-    // The rebuild has to happen before the BFS for overlap refs (where
-    // some of the ref's edges land within its destination range).
+    // Mirrors the `apply_dist_redirect_incremental` order: mutate event,
+    // rebuild rev, recopy, BFS over fresh rev. The rebuild must precede
+    // the BFS for overlap refs (some ref edges land within the
+    // destination range).
     let redirect_step = |events: &mut Vec<Event>,
                          output: &mut Vec<u8>,
                          rev: &mut pngbend::index::ReverseGraph,
@@ -632,30 +658,28 @@ fn surgical_redirect_apply_undo_round_trip_with_overlap() {
     }
 }
 
-/// Synthetic overlap regression. Build an `events` list by hand with a
-/// ref that overlaps its destination (`src + len > out_pos`) and where
-/// the period of the resulting run-length pattern *changes* under the
-/// redirect — i.e. the pre-edit overlap produces an `a,b,c,a,b,c,…`
-/// pattern (period 3) and the post-edit produces something different
-/// (period 4). On those, the BFS using a stale `rev_graph` writes wrong
-/// values into the destination range; period-2-in-both-directions
-/// candidates from real photos can mask the bug because every wrong-edge
-/// write coincidentally lands on a correct value.
+/// Synthetic overlap regression. Hand-build an `events` list with a ref
+/// that overlaps its destination (`src + len > out_pos`) where the
+/// run-length period *changes* under the redirect: pre-edit period 3
+/// (`a,b,c,a,b,c,...`), post-edit period 4. There, a BFS on a stale
+/// `rev_graph` writes wrong values into the destination range;
+/// period-2-both-ways candidates from real photos mask the bug because
+/// every wrong-edge write coincidentally lands on a correct value.
 ///
-/// This test bypasses the deflate decoder and constructs the events +
-/// output state directly so we can exercise an exact period mismatch.
+/// Bypasses the deflate decoder and constructs events + output directly
+/// to exercise an exact period mismatch.
 #[test]
 fn surgical_redirect_overlap_period_mismatch_round_trip() {
     use pngbend::deflate::{LitEvent, RefEvent};
     use pngbend::index::ReverseGraph;
 
     // Output layout (32 bytes for headroom):
-    //   indices 0..6 are literal events (a, b, c, p, q, r, ...)
-    //   index   6..14: a single ref. src_orig=3, copy_len=8 → period 3
-    //                  pattern p,q,r,p,q,r,p,q.
-    //   index   14..18: a downstream ref of length 4 sourced from
-    //                   indices 6..10, exercising "external descendants
-    //                   that depend on the redirected ref's bytes".
+    //   0..6:   literal events (a, b, c, p, q, r, ...)
+    //   6..14:  single ref, src_orig=3, copy_len=8, period 3:
+    //           pattern p,q,r,p,q,r,p,q.
+    //   14..18: downstream ref, len 4, sourced from 6..10, exercising
+    //           external descendants that depend on the redirected ref's
+    //           bytes.
     let n_lit: u32 = 6;
     let mut events: Vec<Event> = (0..n_lit)
         .map(|i| {
@@ -663,7 +687,6 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
                 out_pos: i,
                 symbol: 0,
                 bit_start: i * 8,
-                block: 0,
             })
         })
         .collect();
@@ -674,7 +697,6 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
         copy_len: 8,
         dist_sym: 0,
         dist_bit_start: n_lit * 8,
-        block: 0,
     }));
     // Ref event 7: downstream, src=6 (= start of dest range), len=4, out_pos=14.
     //   This makes positions 14..18 transitive descendants of 6..10
@@ -686,7 +708,6 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
         copy_len: 4,
         dist_sym: 0,
         dist_bit_start: 0,
-        block: 0,
     }));
 
     // Pre-edit output (constructed from the event chain by hand).
@@ -699,7 +720,7 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
     for off in 0..8 {
         output[6 + off] = output[3 + off];
     }
-    // Ref at 14: src=6, len=4 → o[14]=o[6]=40, o[15]=o[7]=50, o[16]=o[8]=60, o[17]=o[9]=40.
+    // Ref at 14: src=6, len=4: o[14]=o[6]=40, o[15]=o[7]=50, o[16]=o[8]=60, o[17]=o[9]=40.
     for off in 0..4 {
         output[14 + off] = output[6 + off];
     }
@@ -710,7 +731,7 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
     let out_pos: usize = n_lit as usize;
     let copy_len = 8;
     let src_orig: u32 = 3;
-    // New src=2 → period 4 (out_pos - new_src = 4).
+    // New src=2, period 4 (out_pos - new_src = 4).
     let new_src: u32 = 2;
 
     let redirect_step =
@@ -718,12 +739,12 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
             if let Event::Ref(r) = &mut events[event_idx] {
                 r.src_out_pos = new_src;
             }
-            // Mirrors the fixed production order in
-            // `apply_dist_redirect_incremental`: rebuild rev BEFORE the
+            // Mirrors production order in
+            // `apply_dist_redirect_incremental`: rebuild rev BEFORE
             // recopy + BFS so the BFS sees post-edit topology. With a
             // stale rev, an overlap ref's intra-destination edges differ
-            // from the post-edit ones and the BFS overwrites correctly
-            // recopied bytes — the bug this test was added to catch.
+            // and the BFS overwrites correctly recopied bytes, the bug
+            // this test guards against.
             *rev = build_reverse_graph(events, output.len());
             let new_src_us = new_src as usize;
             for off in 0..copy_len {
@@ -755,12 +776,12 @@ fn surgical_redirect_overlap_period_mismatch_round_trip() {
     );
 }
 
-// ── Hand-built sub-byte PNG fixtures ──────────────────────────────────────
+// Hand-built sub-byte PNG fixtures
 //
-// These tests build a minimal-but-valid PNG byte stream in memory (IHDR +
-// optional PLTE + IDAT-as-stored-deflate-block + IEND) and round-trip it
-// through pngbend's full loader. They give us coverage of the 1/2/4-bit
-// greyscale and indexed paths without committing binary fixtures.
+// Build a minimal valid PNG in memory (IHDR + optional PLTE +
+// IDAT-as-stored-deflate-block + IEND) and round-trip it through
+// pngbend's full loader. Covers the 1/2/4-bit greyscale and indexed
+// paths without committing binary fixtures.
 
 use pngbend::png::{Chunk, build_zlib_stream, parse_zlib_stream, to_rgba8, write_chunks};
 
@@ -776,10 +797,10 @@ fn deflate_stored(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Assemble a complete PNG byte stream from raw scanlines (each row is
-/// a filter byte followed by `row_data_bytes` of pixel data) plus an
-/// optional palette. Uses pngbend's own `build_zlib_stream` and
-/// `write_chunks` so the round-trip exercises the matching read paths.
+/// Assemble a complete PNG from raw scanlines (each row a filter byte +
+/// pixel data) plus an optional palette. Uses pngbend's own
+/// `build_zlib_stream` and `write_chunks` so the round-trip exercises the
+/// matching read paths.
 fn build_png(
     width: u32,
     height: u32,
@@ -796,40 +817,40 @@ fn build_png(
     // compression_method=0, filter_method=0, interlace_method=0 already zero.
 
     let deflate = deflate_stored(scanlines);
-    let idat_payload = build_zlib_stream(&deflate, &[0x78, 0x9C], scanlines);
+    let idat_payload = build_zlib_stream(&deflate, [0x78, 0x9C], scanlines);
 
     let mut chunks = vec![Chunk {
-        typ: *b"IHDR",
+        typ: ChunkType::IHDR,
         data: ihdr_data,
     }];
     if let Some(pal) = palette {
         chunks.push(Chunk {
-            typ: *b"PLTE",
+            typ: ChunkType::PLTE,
             data: pal.to_vec(),
         });
     }
     chunks.push(Chunk {
-        typ: *b"IDAT",
+        typ: ChunkType::IDAT,
         data: idat_payload,
     });
     chunks.push(Chunk {
-        typ: *b"IEND",
+        typ: ChunkType::IEND,
         data: vec![],
     });
     write_chunks(&chunks)
 }
 
-/// Decode a synthetic PNG through pngbend's full loader stack and return
-/// the resulting RGBA8 buffer. The palette is discovered from the PLTE
-/// chunk if present, so test sites pass only the PNG bytes.
+/// Decode a synthetic PNG through pngbend's full loader stack to RGBA8.
+/// Palette discovered from the PLTE chunk if present, so test sites pass
+/// only the PNG bytes.
 fn round_trip(png: &[u8]) -> Vec<u8> {
-    let parsed = read_chunks(png).expect("chunks");
-    let info = parse_ihdr(&parsed).expect("ihdr");
-    let palette = parsed
+    let chunks = read_chunks(png).expect("chunks").chunks;
+    let info = parse_ihdr(&chunks).expect("ihdr");
+    let palette = chunks
         .iter()
-        .find(|c| &c.typ == b"PLTE")
+        .find(|c| c.typ == ChunkType::PLTE)
         .map(|p| pngbend::png::decode_palette(&p.data, None));
-    let idat = concat_idat(&parsed);
+    let idat = concat_idat(&chunks);
     let zlib = parse_zlib_stream(&idat).expect("zlib");
     let decoded = decode_deflate(zlib.deflate_buf, None).expect("deflate");
     let unfiltered = unfilter(&decoded.output, &info).expect("unfilter");
@@ -838,8 +859,8 @@ fn round_trip(png: &[u8]) -> Vec<u8> {
 
 #[test]
 fn round_trip_8x1_1bit_greyscale() {
-    // Scanline: filter=None (0), 1 data byte 0b1011_0001
-    // → pixels 1, 0, 1, 1, 0, 0, 0, 1 → lumas 255 0 255 255 0 0 0 255.
+    // Scanline: filter=None (0), 1 data byte 0b1011_0001.
+    // Pixels 1, 0, 1, 1, 0, 0, 0, 1; lumas 255 0 255 255 0 0 0 255.
     let scanlines = vec![0u8, 0b1011_0001];
     let png = build_png(8, 1, 1, 0, &scanlines, None);
     let rgba = round_trip(&png);
@@ -849,7 +870,7 @@ fn round_trip_8x1_1bit_greyscale() {
 
 #[test]
 fn round_trip_4x1_2bit_greyscale() {
-    // 2-bit samples 0, 1, 2, 3 packed MSB-first → byte 0b00_01_10_11 = 0x1B.
+    // 2-bit samples 0, 1, 2, 3 packed MSB-first: byte 0b00_01_10_11 = 0x1B.
     // Scaled lumas: 0, 85, 170, 255.
     let scanlines = vec![0u8, 0b00_01_10_11];
     let png = build_png(4, 1, 2, 0, &scanlines, None);
@@ -872,7 +893,7 @@ fn round_trip_2x1_4bit_greyscale() {
 #[test]
 fn round_trip_8x1_1bit_indexed() {
     // 2-colour palette: index 0 = red, index 1 = blue.
-    // Byte 0b1010_0000 → indices 1, 0, 1, 0, 0, 0, 0, 0.
+    // Byte 0b1010_0000: indices 1, 0, 1, 0, 0, 0, 0, 0.
     let palette = vec![255, 0, 0, 0, 0, 255]; // PLTE is RGB triples.
     let scanlines = vec![0u8, 0b1010_0000];
     let png = build_png(8, 1, 1, 3, &scanlines, Some(&palette));
@@ -893,7 +914,7 @@ fn round_trip_8x1_1bit_indexed() {
 #[test]
 fn round_trip_5x1_1bit_greyscale_width_not_multiple_of_eight() {
     // 5 pixels at 1 bit each = 5 used bits in 1 byte (3 padding bits).
-    // Bits 1, 0, 1, 0, 1, _, _, _ → byte 0b1010_1000.
+    // Bits 1, 0, 1, 0, 1, _, _, _: byte 0b1010_1000.
     let scanlines = vec![0u8, 0b1010_1000];
     let png = build_png(5, 1, 1, 0, &scanlines, None);
     let rgba = round_trip(&png);
@@ -905,9 +926,9 @@ fn round_trip_5x1_1bit_greyscale_width_not_multiple_of_eight() {
 #[test]
 fn round_trip_5x1_4bit_indexed_odd_width() {
     // 5 pixels at 4 bits each = 5 nibbles in 3 bytes (1 padding nibble).
-    // Indices 1, 2, 3, 4, 5 → bytes 0x12, 0x34, 0x5_ (low nibble padding).
+    // Indices 1, 2, 3, 4, 5: bytes 0x12, 0x34, 0x5_ (low nibble padding).
     let scanlines = vec![0u8, 0x12, 0x34, 0x50];
-    // 6 palette entries (indices 0..5) — black, then five distinct colours.
+    // 6 palette entries (indices 0..5): black, then five distinct colours.
     let palette: Vec<u8> = vec![
         0, 0, 0, // 0: black
         10, 0, 0, // 1
@@ -928,8 +949,8 @@ fn round_trip_5x1_4bit_indexed_odd_width() {
 #[test]
 fn round_trip_3x2_1bit_greyscale_multi_row() {
     // Two rows, 3 pixels each = 1 data byte per row (5 padding bits).
-    // Row 0: 1, 0, 1, _, _, _, _, _ → 0b1010_0000
-    // Row 1: 0, 1, 0, _, _, _, _, _ → 0b0100_0000
+    // Row 0: 1, 0, 1, _, _, _, _, _ = 0b1010_0000
+    // Row 1: 0, 1, 0, _, _, _, _, _ = 0b0100_0000
     let scanlines = vec![0u8, 0b1010_0000, 0u8, 0b0100_0000];
     let png = build_png(3, 2, 1, 0, &scanlines, None);
     let rgba = round_trip(&png);

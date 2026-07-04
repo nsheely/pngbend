@@ -1,16 +1,59 @@
-//! PNG row-filter unfiltering.
+//! PNG row filtering, both directions.
 //!
-//! A decoded PNG deflate stream is `h` rows of `1 + w * bpp` bytes. Each
-//! row begins with a filter type (0..=4); the remaining `w * bpp` bytes
-//! are the filtered pixel data. [`unfilter`] applies the inverse filter
-//! per row to produce `h * w * bpp` contiguous raw pixel bytes (no
-//! filter prefix).
+//! A PNG deflate stream is `h` rows of `1 + w * bpp` bytes. Each row
+//! begins with a [`FilterType`]; the remaining `w * bpp` bytes are the
+//! filtered pixel data. [`unfilter`] applies the inverse filter per row to
+//! produce `h * w * bpp` contiguous raw bytes (no filter prefix);
+//! [`filter`] is the forward direction, choosing a filter per row and
+//! prepending it.
 //!
 //! [`unfilter_rows_into`] is the row-scoped variant the incremental
 //! editor uses: re-run only the rows whose filtered bytes changed, plus
-//! any downstream rows that read from them via filter types 2/3/4.
+//! any downstream rows that read from them via filter types Up/Average/Paeth.
 
 use super::chunks::PngInfo;
+
+/// One of the five PNG row filters (spec §9.2). The byte value is the
+/// leading byte of each filtered row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterType {
+    None,
+    Sub,
+    Up,
+    Average,
+    Paeth,
+}
+
+impl FilterType {
+    /// Every filter, in byte order, for the heuristic to trial.
+    pub const ALL: [FilterType; 5] = [Self::None, Self::Sub, Self::Up, Self::Average, Self::Paeth];
+
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::None,
+            1 => Self::Sub,
+            2 => Self::Up,
+            3 => Self::Average,
+            4 => Self::Paeth,
+            _ => return None,
+        })
+    }
+
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// How [`filter`] picks each row's filter.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FilterStrategy {
+    /// Use one filter for every row.
+    Fixed(FilterType),
+    /// Per row, pick the filter with the minimum sum of absolute signed
+    /// filtered bytes (the standard libpng heuristic for compressibility).
+    #[default]
+    MinSad,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterError {
@@ -75,9 +118,8 @@ pub fn unfilter(stream: &[u8], info: &PngInfo) -> Result<Vec<u8>, FilterError> {
 /// in a state consistent with the *un*modified portion of `stream`.
 ///
 /// `changed_row` returns `true` when row `y`'s filtered bytes differ from
-/// the last time `unfiltered` was computed. The caller tracks this; the
-/// incremental edit path knows because it records every `output`
-/// position it wrote to.
+/// the last time `unfiltered` was computed. The caller tracks this (the
+/// incremental edit path records every `output` position it writes).
 ///
 /// Returns the number of rows re-unfiltered. Used for telemetry and as
 /// input to `to_rgba8_rows_into`.
@@ -100,7 +142,7 @@ pub fn unfilter_rows_into(
 
     let mut rebuilt = 0usize;
     let mut prev_was_updated = false;
-    let mut zero_prev = vec![0u8; row_bytes];
+    let zero_prev = vec![0u8; row_bytes];
 
     for y in first_affected..h {
         let stream_start = y * row_stride;
@@ -118,6 +160,8 @@ pub fn unfilter_rows_into(
             continue;
         }
 
+        let ft =
+            FilterType::from_byte(filter).ok_or(FilterError::UnknownFilter { row: y, filter })?;
         let filt = &stream[stream_start + 1..stream_end];
         let row_off = y * row_bytes;
         let (prev, curr): (&[u8], &mut [u8]) = if y == 0 {
@@ -128,34 +172,23 @@ pub fn unfilter_rows_into(
             (prev, &mut tail[..row_bytes])
         };
 
-        apply_unfilter(filter, filt, prev, curr, bpp)
-            .map_err(|_| FilterError::UnknownFilter { row: y, filter })?;
+        apply_unfilter(ft, filt, prev, curr, bpp);
         on_rebuilt(y);
         rebuilt += 1;
         prev_was_updated = true;
-        // zero_prev only used for y == 0; no-op hint for the borrow checker.
-        let _ = &mut zero_prev;
     }
     Ok(rebuilt)
 }
 
 #[inline]
-fn apply_unfilter(
-    filter: u8,
-    filt: &[u8],
-    prev: &[u8],
-    curr: &mut [u8],
-    bpp: usize,
-) -> Result<(), ()> {
+fn apply_unfilter(filter: FilterType, filt: &[u8], prev: &[u8], curr: &mut [u8], bpp: usize) {
     match filter {
-        0 => curr.copy_from_slice(filt),
-        1 => sub_unfilter(filt, curr, bpp),
-        2 => up_unfilter(filt, prev, curr),
-        3 => avg_unfilter(filt, prev, curr, bpp),
-        4 => paeth_unfilter(filt, prev, curr, bpp),
-        _ => return Err(()),
+        FilterType::None => curr.copy_from_slice(filt),
+        FilterType::Sub => sub_unfilter(filt, curr, bpp),
+        FilterType::Up => up_unfilter(filt, prev, curr),
+        FilterType::Average => avg_unfilter(filt, prev, curr, bpp),
+        FilterType::Paeth => paeth_unfilter(filt, prev, curr, bpp),
     }
-    Ok(())
 }
 
 #[inline]
@@ -169,8 +202,8 @@ fn sub_unfilter(filt: &[u8], curr: &mut [u8], bpp: usize) {
 #[inline]
 fn up_unfilter(filt: &[u8], prev: &[u8], curr: &mut [u8]) {
     // Per-byte wrapping add. LLVM auto-vectorises this at `-O3` into a
-    // 128-bit SIMD loop equivalent to a hand-rolled `wide::u8x16`, so
-    // there's no benefit to writing the SIMD by hand here.
+    // 128-bit SIMD loop equivalent to a hand-rolled `wide::u8x16`; no
+    // benefit to hand-writing SIMD.
     for i in 0..filt.len() {
         curr[i] = filt[i].wrapping_add(prev[i]);
     }
@@ -216,22 +249,97 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
+/// Apply PNG row filters forward: prepend a per-row [`FilterType`] and
+/// store the filtered residuals, the inverse of [`unfilter`]. `raw` is a
+/// contiguous `h * (row_stride - 1)` buffer; the result is a
+/// `h * row_stride` stream ready to deflate.
+pub fn filter(raw: &[u8], info: &PngInfo, strategy: FilterStrategy) -> Vec<u8> {
+    let h = info.height as usize;
+    let row_stride = info.row_stride;
+    let row_bytes = row_stride - 1;
+    let bpp = info.bpp;
+    let mut out = vec![0u8; h * row_stride];
+    let zero_prev = vec![0u8; row_bytes];
+    let mut scratch = vec![0u8; row_bytes];
+
+    for y in 0..h {
+        let curr = &raw[y * row_bytes..y * row_bytes + row_bytes];
+        let prev: &[u8] = if y == 0 {
+            &zero_prev
+        } else {
+            &raw[(y - 1) * row_bytes..y * row_bytes]
+        };
+        let ft = match strategy {
+            FilterStrategy::Fixed(ft) => ft,
+            FilterStrategy::MinSad => choose_min_sad(curr, prev, bpp, &mut scratch),
+        };
+        let out_row = &mut out[y * row_stride..(y + 1) * row_stride];
+        out_row[0] = ft.as_byte();
+        apply_filter(ft, curr, prev, bpp, &mut out_row[1..]);
+    }
+    out
+}
+
+/// Trial every filter into `scratch` and return the one whose residuals
+/// have the smallest sum of absolute signed values.
+fn choose_min_sad(curr: &[u8], prev: &[u8], bpp: usize, scratch: &mut [u8]) -> FilterType {
+    let mut best = FilterType::None;
+    let mut best_sad = u32::MAX;
+    for ft in FilterType::ALL {
+        apply_filter(ft, curr, prev, bpp, scratch);
+        let sad: u32 = scratch
+            .iter()
+            .map(|&b| (b as i8 as i32).unsigned_abs())
+            .sum();
+        if sad < best_sad {
+            best_sad = sad;
+            best = ft;
+        }
+    }
+    best
+}
+
+/// Write the residuals for one row under `filter` into `dst`. Each residual
+/// is `curr - predictor`, the exact inverse of the matching `*_unfilter`.
+#[inline]
+fn apply_filter(filter: FilterType, curr: &[u8], prev: &[u8], bpp: usize, dst: &mut [u8]) {
+    match filter {
+        FilterType::None => dst.copy_from_slice(curr),
+        FilterType::Sub => {
+            for i in 0..curr.len() {
+                let left = if i >= bpp { curr[i - bpp] } else { 0 };
+                dst[i] = curr[i].wrapping_sub(left);
+            }
+        }
+        FilterType::Up => {
+            for i in 0..curr.len() {
+                dst[i] = curr[i].wrapping_sub(prev[i]);
+            }
+        }
+        FilterType::Average => {
+            for i in 0..curr.len() {
+                let left = if i >= bpp { curr[i - bpp] } else { 0 };
+                let avg = ((left as u16 + prev[i] as u16) / 2) as u8;
+                dst[i] = curr[i].wrapping_sub(avg);
+            }
+        }
+        FilterType::Paeth => {
+            for i in 0..curr.len() {
+                let left = if i >= bpp { curr[i - bpp] } else { 0 };
+                let upleft = if i >= bpp { prev[i - bpp] } else { 0 };
+                dst[i] = curr[i].wrapping_sub(paeth_predictor(left, prev[i], upleft));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::png::ColorType;
 
     fn info(w: u32, h: u32, color: ColorType, bit_depth: u8) -> PngInfo {
-        let channels = color.channels() as usize;
-        let bpp = ((channels * bit_depth as usize) / 8).max(1);
-        PngInfo {
-            width: w,
-            height: h,
-            bit_depth,
-            color_type: color,
-            bpp,
-            row_stride: 1 + w as usize * bpp,
-        }
+        PngInfo::new(w, h, bit_depth, color)
     }
 
     #[test]
@@ -309,5 +417,41 @@ mod tests {
         assert_eq!(paeth_predictor(5, 10, 7), 7); // p=8, pa=3, pb=2, pc=1 → c
         assert_eq!(paeth_predictor(10, 10, 10), 10); // all equal → a
         assert_eq!(paeth_predictor(0, 255, 0), 255); // b wins cleanly
+    }
+
+    #[test]
+    fn filter_then_unfilter_round_trips_every_fixed_type() {
+        // A gradient image exercises every predictor. RGB 8-bit, 5×4.
+        let g = info(5, 4, ColorType::Rgb, 8);
+        let row_bytes = g.row_stride - 1;
+        let raw: Vec<u8> = (0..g.height as usize * row_bytes)
+            .map(|i| (i * 7 + 3) as u8)
+            .collect();
+        for ft in FilterType::ALL {
+            let stream = filter(&raw, &g, FilterStrategy::Fixed(ft));
+            assert_eq!(stream.len(), g.height as usize * g.row_stride);
+            assert!(stream.chunks(g.row_stride).all(|r| r[0] == ft.as_byte()));
+            assert_eq!(unfilter(&stream, &g).unwrap(), raw, "filter {ft:?}");
+        }
+    }
+
+    #[test]
+    fn filter_min_sad_round_trips_and_stays_valid() {
+        // MinSad picks per row; the result must still invert to the original
+        // and every chosen filter byte must be a legal 0..=4.
+        for (w, h, color, depth) in [
+            (4, 3, ColorType::Rgba, 8),
+            (7, 5, ColorType::Greyscale, 8),
+            (3, 3, ColorType::Rgb, 16),
+        ] {
+            let g = info(w, h, color, depth);
+            let row_bytes = g.row_stride - 1;
+            let raw: Vec<u8> = (0..h as usize * row_bytes)
+                .map(|i| (i * i + 11) as u8)
+                .collect();
+            let stream = filter(&raw, &g, FilterStrategy::MinSad);
+            assert!(stream.chunks(g.row_stride).all(|r| r[0] <= 4));
+            assert_eq!(unfilter(&stream, &g).unwrap(), raw);
+        }
     }
 }

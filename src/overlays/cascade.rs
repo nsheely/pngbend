@@ -1,8 +1,9 @@
 //! Cascade overlay: yellow/orange/red for LZ77 fan-out from a clicked pixel,
 //! plus a faint blue halo for PNG row-filter propagation.
 
-use crate::coords::{ImgGeom, OutPos};
+use crate::coords::OutPos;
 use crate::index::Cascade;
+use crate::png::PngInfo;
 
 /// Per-row min pixel-x reached by PNG row-filter propagation from
 /// LZ77-affected bytes. `min_x[row] == None` means that row is unaffected;
@@ -19,20 +20,16 @@ impl FilterExpansion {
             .enumerate()
             .filter_map(|(row, opt)| opt.map(|x| (row as u32, x)))
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.min_x.iter().all(Option::is_none)
-    }
 }
 
 /// Propagate LZ77-affected byte positions through PNG row filters.
 pub fn compute_filter_expansion(
     affected: &[u32],
     output: &[u8],
-    geom: &ImgGeom,
+    info: &PngInfo,
 ) -> FilterExpansion {
-    let h = geom.h as usize;
-    let row_stride = geom.row_stride as usize;
+    let h = info.height as usize;
+    let row_stride = info.row_stride;
 
     // Row filter type for each row.
     let row_ft: Vec<u8> = (0..h)
@@ -42,7 +39,7 @@ pub fn compute_filter_expansion(
     // Min pixel-x hit by LZ77 in each row (sentinel `u32::MAX` = unset).
     let mut lz77_min_x: Vec<u32> = vec![u32::MAX; h];
     for &pos in affected {
-        if let Some(xy) = geom.out_to_xy(OutPos(pos)) {
+        if let Some(xy) = info.out_to_xy(OutPos(pos)) {
             let row = xy.y as usize;
             if row < h && xy.x < lz77_min_x[row] {
                 lz77_min_x[row] = xy.x;
@@ -93,10 +90,10 @@ pub fn compute_filter_expansion(
 pub fn make_cascade_overlay_bytes(
     cascade: &Cascade,
     filter: &FilterExpansion,
-    geom: &ImgGeom,
+    info: &PngInfo,
 ) -> Vec<u8> {
-    let w = geom.w as usize;
-    let h = geom.h as usize;
+    let w = info.width as usize;
+    let h = info.height as usize;
     let mut rgba = vec![0u8; w * h * 4];
     let max_d = cascade.max_depth.max(1);
 
@@ -116,15 +113,14 @@ pub fn make_cascade_overlay_bytes(
     }
 
     // Each affected byte may cover several pixels (sub-byte depths). Paint
-    // the whole cluster so the overlay reflects the edit's true reach —
-    // for ≥ 8-bit depths the inner loop runs once and matches the simple
-    // one-byte-one-pixel case.
-    let ppb = geom.pixels_per_byte();
+    // the whole cluster so the overlay reflects the edit's true reach. For
+    // ≥ 8-bit depths the inner loop runs once, matching one-byte-one-pixel.
+    let ppb = info.pixels_per_byte();
     for &pos in cascade.affected {
-        let Some(xy) = geom.out_to_xy(OutPos(pos)) else {
+        let Some(xy) = info.out_to_xy(OutPos(pos)) else {
             continue;
         };
-        let cluster_end = (xy.x + ppb).min(geom.w);
+        let cluster_end = (xy.x + ppb).min(info.width);
         let d = cascade.depth(pos).unwrap_or(0);
         let colour = cascade_colour(d, max_d);
         let row = xy.y as usize;
@@ -140,7 +136,7 @@ pub fn make_cascade_overlay_bytes(
 #[inline]
 fn cascade_colour(depth: u32, max_d: u32) -> [u8; 4] {
     if depth == 0 {
-        return [255, 255, 80, 220]; // bright yellow — the seed
+        return [255, 255, 80, 220]; // bright yellow, the seed
     }
     let t = (depth as f32 / max_d as f32).min(1.0);
     let g = (200.0 * (1.0 - t)) as u8;
