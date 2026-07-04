@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege GITHUB_TOKEN for every job: this workflow only reads the
+# repo (checkout, build, test, lint, cargo-deny) and uploads build artifacts,
+# none of which need write access.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint
