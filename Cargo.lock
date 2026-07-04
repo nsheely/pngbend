@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "glasspng"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png 0.17.16",
  "proptest",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "pngbend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "eframe",
@@ -2715,9 +2715,9 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.2"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
  "serde",

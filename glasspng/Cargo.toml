@@ -1,7 +1,8 @@
 [package]
 name = "glasspng"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Glass-box PNG codec: decode to pixels, or inspect the DEFLATE literal/back-reference event stream and per-block Huffman tables behind each pixel, then re-emit a valid PNG after editing."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

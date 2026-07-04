@@ -7,8 +7,9 @@ all = { level = "deny", priority = -1 }
 
 [package]
 name = "pngbend"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Interactive bit-level PNG editor: inspect and edit the DEFLATE literals and LZ77 back-references that produced each pixel, then save the patched stream as a valid PNG."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
