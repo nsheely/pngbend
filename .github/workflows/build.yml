@@ -92,14 +92,12 @@ jobs:
       - name: Build all targets (debug)
         run: cargo build --workspace --all-targets --verbose
 
-      # The differential conformance corpus isn't vendored; fetch it so the
-      # pngsuite test runs instead of skipping. Linux only: the test is
-      # platform-independent and skips cleanly where the corpus is absent.
-      # Non-fatal: a flaky upstream host must not red the build; the test
-      # skips if the corpus didn't download.
+      # The differential conformance corpus isn't vendored; fetch it (from a
+      # pinned GitHub mirror) so the pngsuite test runs instead of skipping.
+      # Linux only: the test is platform-independent and skips cleanly on the
+      # other runners, where the corpus is absent.
       - name: Fetch PngSuite corpus
         if: runner.os == 'Linux'
-        continue-on-error: true
         run: bash scripts/fetch-pngsuite.sh
 
       - name: Run tests
