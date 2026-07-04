@@ -243,14 +243,11 @@ enum PixelKind {
     Ref,
 }
 
-/// Per-event class byte, precomputed in `build_pixel_index`. Encodes only
+/// Per-event class for the pixel index's hot loop, one byte each. Encodes only
 /// what the per-pixel classifier needs (literal vs redirectable ref, plus
-/// whether a literal has a same-length swap), so the hot loop reads one
-/// byte per channel and never touches `events` or the per-block Huffman
-/// tables. A non-redirectable ref is `SKIP`, contributing nothing like an
-/// unowned channel.
-/// Per-event class for the pixel index's hot loop, one byte each (`#[repr(u8)]`
-/// keeps the `Vec` the same size as the old `Vec<u8>`).
+/// whether a literal has a same-length swap), so the loop reads one byte per
+/// channel and never touches `events` or the per-block Huffman tables. A
+/// non-redirectable ref is `Skip`, like an unowned channel.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum EventClass {
@@ -379,11 +376,21 @@ fn precompute_redirectable_dist_syms(dist_encs: &[EncTable]) -> Vec<DistRedirMas
         .collect()
 }
 
+/// A redirect target for a back-reference: point it at `dist_sym` and its
+/// source moves to `src_out_pos`, `distance` bytes back. `src_out_pos` and
+/// `distance` are both `u32`, so the named fields keep them from being
+/// transposed at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistAlt {
+    pub dist_sym: u8,
+    pub src_out_pos: u32,
+    pub distance: u32,
+}
+
 /// Iterate dist-symbols in `de` that are valid redirect targets for the
 /// back-reference at `(out_pos, src_out_pos)` with current symbol `cur_sym`.
 /// Valid: same Huffman length, same `DEXT` extra-bits class, and a
-/// non-negative new source position. Yields
-/// `(new_dist_sym, new_src_out_pos, new_distance)` for each.
+/// non-negative new source position.
 ///
 /// `None` only when `cur_sym` isn't present in `de`: nothing to redirect
 /// from.
@@ -392,7 +399,7 @@ fn compatible_dist_alts<'a>(
     cur_sym: u8,
     out_pos: u32,
     src_out_pos: u32,
-) -> Option<impl Iterator<Item = (u8, u32, u32)> + 'a> {
+) -> Option<impl Iterator<Item = DistAlt> + 'a> {
     // Symbols 30/31 are reserved (RFC 1951) and have no `DEXT`/`DBASE`
     // entries; refuse them up front rather than panic at the lookup.
     if (cur_sym as usize) >= DBASE.len() {
@@ -412,7 +419,11 @@ fn compatible_dist_alts<'a>(
             }
             let new_dist = DBASE[sym] + extra_val;
             let new_src_signed = out_pos as i64 - new_dist as i64;
-            (new_src_signed >= 0).then_some((sym as u8, new_src_signed as u32, new_dist))
+            (new_src_signed >= 0).then_some(DistAlt {
+                dist_sym: sym as u8,
+                src_out_pos: new_src_signed as u32,
+                distance: new_dist,
+            })
         },
     ))
 }
@@ -436,14 +447,13 @@ fn is_ref_redirectable(
 }
 
 /// Redirect alternatives for a single back-reference.
-/// Returns `(new_dist_sym, new_src_out_pos, new_distance)` for each candidate.
 pub fn valid_dist_alts(
     block: u32,
     dist_sym: u8,
     out_pos: u32,
     src_out_pos: u32,
     dist_encs: &[EncTable],
-) -> Vec<(u8, u32, u32)> {
+) -> Vec<DistAlt> {
     dist_encs
         .get(block as usize)
         .and_then(|de| compatible_dist_alts(de, dist_sym, out_pos, src_out_pos))
@@ -473,8 +483,8 @@ mod tests {
         ]);
         let alts = valid_dist_alts(0, 1, 100, 98, &[de]);
         assert_eq!(alts.len(), 1);
-        assert_eq!(alts[0].0, 2);
-        assert_eq!(alts[0].2, 3);
+        assert_eq!(alts[0].dist_sym, 2);
+        assert_eq!(alts[0].distance, 3);
     }
 
     #[test]

@@ -1,3 +1,6 @@
+//! DEFLATE decode errors: RFC 1951 violations (bad Huffman codes, reserved
+//! symbols and block types) plus the decompression-bomb output cap.
+
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

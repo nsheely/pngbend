@@ -33,28 +33,11 @@ impl BitReader {
         }
     }
 
-    /// Read up to 32 bits, LSB-first within bytes. Over-reads past the
-    /// padded buffer return zero.
+    /// Read up to 32 bits, LSB-first within bytes, advancing the position.
+    /// Over-reads past the padded buffer return zero.
     #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
-        }
-        let byte_idx = self.pos >> 3;
-        if byte_idx + 4 > self.data.len() {
-            self.pos += n as usize;
-            return 0;
-        }
-        let val = u32::from_le_bytes([
-            self.data[byte_idx],
-            self.data[byte_idx + 1],
-            self.data[byte_idx + 2],
-            self.data[byte_idx + 3],
-        ]);
-        // `(1u32 << 32) - 1` overflows `u32` (debug panic, release wrap),
-        // so `n == 32` uses the full `u32::MAX` mask.
-        let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
-        let result = (val >> (self.pos & 7)) & mask;
+        let result = self.peek_bits(n);
         self.pos += n as usize;
         result
     }
@@ -77,6 +60,8 @@ impl BitReader {
             self.data[byte_idx + 2],
             self.data[byte_idx + 3],
         ]);
+        // `(1u32 << 32) - 1` overflows `u32` (debug panic, release wrap),
+        // so `n == 32` uses the full `u32::MAX` mask.
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         (val >> (self.pos & 7)) & mask
     }

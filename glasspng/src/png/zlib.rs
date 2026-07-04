@@ -134,13 +134,9 @@ mod tests {
         assert_eq!(computed, (s2 << 16) | s1);
     }
 
-    /// Standard PNG zlib header: CM=8, CINFO=7, FLEVEL=2, no FDICT.
-    /// CMF=0x78, FLG=0x9C; (0x78*256 + 0x9C) % 31 == 0.
+    /// A zlib IDAT with the default header and a correct Adler-32 over `decoded`.
     fn build_idat(decoded: &[u8], deflate: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x78, 0x9C];
-        out.extend_from_slice(deflate);
-        out.extend_from_slice(&adler32(decoded).to_be_bytes());
-        out
+        build_zlib_stream(deflate, ZLIB_DEFAULT_HEADER, decoded)
     }
 
     #[test]

@@ -1,100 +1,18 @@
-//! Apply / undo / redo machinery for edits that have already been built.
-//!
-//! See [`super::select`] for how [`EditOption`](super::select::EditOption)s
-//! and their underlying [`EditAction`]s come together from a pixel click.
-//!
-//! `apply_edit` dispatches on [`EditKind`]:
-//!
-//! - **Literal swap**: one Huffman code is replaced by another of the
-//!   same length. The output byte at the patched event's position
-//!   becomes the new symbol, and every LZ77 descendant inherits it via
-//!   a BFS over the reverse graph. LZ77 topology is unchanged, so
-//!   `events`, `reverse_graph`, and `pixel_index` all stay valid; only
-//!   `output` and the unfiltered/RGBA/composite buffers for the
-//!   affected rows need to refresh. Cost: `O(affected_rows)` rather
-//!   than `O(image)`.
-//!
-//! - **Distance redirect**: one back-reference's source position moves.
-//!   LZ77 topology shifts at exactly one event, but the rest of the
-//!   index (every other event's bit / output positions, all literals,
-//!   the per-block Huffman tables) stays valid. The redirect path
-//!   patches the event in place, rebuilds the reverse graph (the only
-//!   structural index that has to move), recopies the destination range
-//!   from the new source, and propagates through the fresh graph. The
-//!   render portion is still row-scoped.
+//! Apply / undo / redo dispatch: the [`PngBendApp`] methods that mutate
+//! document + view state per [`EditKind`], plus the LZ77 propagation the
+//! incremental appliers walk.
 
-use crate::bitstream::{read_bits_at, write_bits};
 use crate::deflate::Event;
-use crate::index::event_at;
+use crate::index::{build_reverse_graph, event_at};
 use crate::png::ChunkType;
 
-use super::PngBendApp;
-use super::io::CoreData;
-use super::select::SelectSource;
-
-/// One bit-precise rewrite in the deflate buffer: `value` is written
-/// into the `code_len` bits starting at `bit_start`. Pairs with
-/// [`apply_patches_capturing_prior`], which returns a Vec of these
-/// describing the inverse rewrite for undo.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Patch {
-    pub bit_start: u32,
-    pub value: u32,
-    pub code_len: u8,
-}
-
-/// The output-buffer side of a literal swap: byte at `out_pos` takes
-/// `value`. Captured alongside the deflate-stream [`Patch`] so the
-/// incremental apply path can update `output` (and its LZ77 descendants)
-/// without re-decoding, and so undo can restore the prior bytes.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ByteWrite {
-    pub out_pos: u32,
-    pub value: u8,
-}
-
-/// The patches + kind needed to apply an edit forward and to derive its
-/// inverse for undo/redo.
-#[derive(Clone)]
-pub(super) struct EditAction {
-    /// Low-level bit writes that realise the edit in the deflate stream.
-    /// Always the source of truth for what changes on disk.
-    pub patches: Vec<Patch>,
-    pub label: String,
-    pub kind: EditKind,
-}
-
-/// Structural classification of an edit. Drives whether `apply_edit` can
-/// take the fast in-place path or has to fall back to a full reload.
-#[derive(Clone)]
-pub(super) enum EditKind {
-    /// Same-length Huffman-code literal swap. One entry per patched
-    /// channel, naming the output byte and the new symbol value. Every
-    /// patch maps to an `Event::Lit`; no LZ77 topology changes.
-    LiteralSwap { byte_updates: Vec<ByteWrite> },
-    /// Distance-symbol redirect. The LZ77 source moves but the rest of
-    /// the topology (event count, every other event's `out_pos` /
-    /// `copy_len` / channel role) is unchanged: same-length Huffman codes
-    /// guarantee that. Apply updates `events[i]`, recopies
-    /// `output[out_pos..out_pos+copy_len]` from the new src, and
-    /// propagates via a rebuilt `reverse_graph` (one ref's outgoing edges
-    /// moved), the only structural index that moves; no `decode_deflate`.
-    DistRedirect {
-        /// Output-byte offset of the redirected ref. Doubles as the
-        /// "nothing before this can have changed" floor for
-        /// row-scoped re-render.
-        out_pos: u32,
-        copy_len: u16,
-        /// Target `src_out_pos` for this edit. For undo of a redirect,
-        /// this is the *previous* src.
-        src_after: u32,
-        /// Target `dist_sym` to write into `events[i]`.
-        dist_sym_after: u8,
-    },
-}
+use super::super::PngBendApp;
+use super::super::select::SelectSource;
+use super::render::{apply_patches_capturing_prior, render_affected_rows};
+use super::{ByteWrite, EditAction, EditKind};
 
 impl PngBendApp {
-    pub(super) fn apply_edit(&mut self) {
+    pub(in crate::app) fn apply_edit(&mut self) {
         let Some(i) = self.sel.selected_edit else {
             return;
         };
@@ -108,7 +26,7 @@ impl PngBendApp {
         self.doc.dirty = true;
     }
 
-    pub(super) fn undo(&mut self) {
+    pub(in crate::app) fn undo(&mut self) {
         let Some(entry) = self.doc.history.pop_undo() else {
             return;
         };
@@ -123,7 +41,7 @@ impl PngBendApp {
         );
     }
 
-    pub(super) fn redo(&mut self) {
+    pub(in crate::app) fn redo(&mut self) {
         let Some(entry) = self.doc.history.pop_redo() else {
             return;
         };
@@ -345,7 +263,7 @@ impl PngBendApp {
         // 2. Rebuild reverse_graph against the patched events. CSR
         //    can't be cheaply mutated in place; rebuilding is correct
         //    and cheap enough until a sparse delta-graph lands.
-        c.reverse_graph = crate::index::build_reverse_graph(&c.events, c.output.len());
+        c.reverse_graph = build_reverse_graph(&c.events, c.output.len());
 
         // 3. Recopy output bytes for this ref's destination span. The
         //    new src is upstream of `out_pos` (LZ77 never copies from
@@ -436,7 +354,7 @@ impl PngBendApp {
         }
     }
 
-    pub(super) fn assemble_png_bytes(&self, zlib: &[u8]) -> Vec<u8> {
+    pub(in crate::app) fn assemble_png_bytes(&self, zlib: &[u8]) -> Vec<u8> {
         // Re-emit exactly one IDAT with the (possibly edited) deflate stream;
         // copy every other chunk through unchanged.
         let out_chunks: Vec<crate::png::Chunk> = self
@@ -466,18 +384,15 @@ impl PngBendApp {
     }
 }
 
-// free helpers
-
 /// Tracks which rows had any byte change during one edit, for the
 /// row-scoped re-render afterwards. Bundles `touched` (per-row flag),
 /// `first_affected` (lowest touched row, drives the row-scoped unfilter
-/// loop's start position), and the `(row_stride, h)` geometry needed to
-/// classify a byte position.
+/// loop's start position), and the `row_stride` needed to classify a byte
+/// position. Row count is `touched.len()`.
 struct RowTracker {
     touched: Vec<bool>,
     first_affected: usize,
     row_stride: usize,
-    h: usize,
 }
 
 impl RowTracker {
@@ -486,7 +401,6 @@ impl RowTracker {
             touched: vec![false; info.height as usize],
             first_affected: usize::MAX,
             row_stride: info.row_stride,
-            h: info.height as usize,
         }
     }
 
@@ -495,7 +409,7 @@ impl RowTracker {
     #[inline]
     fn mark(&mut self, pos: usize) {
         let row = pos / self.row_stride;
-        if row < self.h && !self.touched[row] {
+        if row < self.touched.len() && !self.touched[row] {
             self.touched[row] = true;
             if row < self.first_affected {
                 self.first_affected = row;
@@ -530,113 +444,6 @@ fn propagate_lz77(
             }
             rows.mark(di);
             stack.push(dst);
-        }
-    }
-}
-
-/// Row-scoped render pipeline shared by the literal-swap and redirect
-/// paths. Inverse-filters every row flagged in `row_touched` (plus any
-/// downstream rows that chain through Up/Avg/Paeth filter types), then
-/// converts those rows in `base_rgba`. Returns the rebuilt set so the
-/// caller can hand it to `partial_composite_rows` and keep the texture
-/// rebuild row-scoped as well.
-fn render_affected_rows(
-    core: &mut CoreData,
-    base_rgba: &mut [u8],
-    first_affected: usize,
-    row_touched: &[bool],
-) -> Result<Vec<usize>, String> {
-    // Interlaced output has no single progressive raster to patch row by
-    // row, so reassemble the whole image from the (edited) passes into
-    // `base_rgba`. We return no rebuilt rows: overlays are disabled for
-    // interlaced images, so the texture re-uploads `base_rgba` wholesale
-    // instead of compositing the returned row list.
-    if core.info.interlaced {
-        let full =
-            crate::png::deinterlace_to_rgba8(&core.output, &core.info, core.palette.as_deref())
-                .map_err(|e| format!("deinterlace: {e}"))?;
-        base_rgba.copy_from_slice(&full);
-        return Ok(Vec::new());
-    }
-    let mut rebuilt = Vec::with_capacity(row_touched.iter().filter(|b| **b).count() + 4);
-    crate::png::unfilter_rows_into(
-        &core.output,
-        &core.info,
-        &mut core.unfiltered,
-        first_affected,
-        |y| row_touched.get(y).copied().unwrap_or(false),
-        |y| rebuilt.push(y),
-    )
-    .map_err(|e| format!("unfilter: {e}"))?;
-    crate::png::to_rgba8_rows_into(
-        &core.unfiltered,
-        &core.info,
-        core.palette.as_deref(),
-        base_rgba,
-        rebuilt.iter().copied(),
-    )
-    .map_err(|e| format!("rgba: {e}"))?;
-    Ok(rebuilt)
-}
-
-/// Write each patch into `buf`, capturing the bits that were overwritten
-/// so the caller can stash the inverse patch list onto the undo stack.
-fn apply_patches_capturing_prior(buf: &mut [u8], patches: &[Patch]) -> Vec<Patch> {
-    let mut inverse = Vec::with_capacity(patches.len());
-    for &Patch {
-        bit_start,
-        value,
-        code_len,
-    } in patches
-    {
-        let bs = bit_start as usize;
-        let prev = read_bits_at(buf, bs, code_len);
-        inverse.push(Patch {
-            bit_start,
-            value: prev,
-            code_len,
-        });
-        write_bits(buf, bs, value, code_len);
-    }
-    inverse
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Patch, apply_patches_capturing_prior};
-    use proptest::prelude::*;
-
-    proptest! {
-        /// The undo invariant: applying an edit's patches forward, then
-        /// applying the captured inverse, restores `deflate_buf`
-        /// byte-for-byte. Real `EditAction.patches` are non-overlapping
-        /// (one patch per channel for literal swaps, one per redirect),
-        /// so the generator lays patches out sequentially with a 1-bit
-        /// gap to mirror that.
-        #[test]
-        fn forward_then_inverse_restores_buffer(
-            buf in proptest::collection::vec(any::<u8>(), 4..64usize),
-            specs in proptest::collection::vec((1u8..=16, any::<u32>()), 1..7),
-        ) {
-            let max_bit = buf.len() * 8;
-            let mut bit_cursor: u32 = 0;
-            let mut patches: Vec<Patch> = Vec::new();
-            for (cl, v) in specs {
-                let cl_u32 = cl as u32;
-                if (bit_cursor + cl_u32) as usize > max_bit {
-                    break;
-                }
-                let mask = if cl == 32 { u32::MAX } else { (1u32 << cl) - 1 };
-                patches.push(Patch { bit_start: bit_cursor, value: v & mask, code_len: cl });
-                bit_cursor += cl_u32 + 1;
-            }
-            prop_assume!(!patches.is_empty());
-
-            let original = buf.clone();
-            let mut work = buf;
-            let inverse = apply_patches_capturing_prior(&mut work, &patches);
-            let _ = apply_patches_capturing_prior(&mut work, &inverse);
-            prop_assert_eq!(work, original);
         }
     }
 }

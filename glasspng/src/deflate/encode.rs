@@ -254,6 +254,18 @@ fn rle_code_lengths(lengths: &[u8]) -> Vec<(u8, u8)> {
     out
 }
 
+/// Count of `lengths` after trimming trailing zeros, floored at `floor`.
+/// HLIT / HDIST are this over the lit / dist code-length arrays. Their
+/// floors are the RFC 1951 minimums: 257 literal/length codes (HLIT is
+/// transmitted as count - 257) and 1 distance code.
+fn used_len(lengths: &[u8], floor: usize) -> usize {
+    lengths
+        .iter()
+        .rposition(|&l| l != 0)
+        .map_or(0, |i| i + 1)
+        .max(floor)
+}
+
 /// Serialize an [`Event`] stream as a single dynamic-Huffman (BTYPE=10)
 /// block with optimal code lengths for its symbol frequencies.
 pub fn serialize_dynamic(events: &[Event]) -> Vec<u8> {
@@ -277,16 +289,8 @@ pub fn serialize_dynamic(events: &[Event]) -> Vec<u8> {
         dist_lengths[0] = 1; // DEFLATE requires at least one distance code
     }
 
-    let hlit = lit_lengths
-        .iter()
-        .rposition(|&l| l != 0)
-        .map_or(0, |i| i + 1)
-        .max(257);
-    let hdist = dist_lengths
-        .iter()
-        .rposition(|&l| l != 0)
-        .map_or(0, |i| i + 1)
-        .max(1);
+    let hlit = used_len(&lit_lengths, 257);
+    let hdist = used_len(&dist_lengths, 1);
 
     let combined: Vec<u8> = lit_lengths[..hlit]
         .iter()

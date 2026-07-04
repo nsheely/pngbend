@@ -63,6 +63,23 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  # Verify glasspng's declared MSRV is executable truth. Only the codec has a
+  # low, independently-meaningful floor (1.88, zero runtime deps); the editor
+  # inherits 1.92 from the egui stack, which cargo enforces and the stable
+  # build job already exercises.
+  msrv:
+    name: MSRV (glasspng 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Build and test glasspng on its MSRV
+        run: cargo test -p glasspng
+
   build:
     name: Build
     strategy:

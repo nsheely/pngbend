@@ -9,7 +9,10 @@ all = { level = "deny", priority = -1 }
 name = "pngbend"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+# The egui stack (eframe/egui/epaint) requires Rust 1.92; the editor inherits
+# that floor. The zero-dependency `glasspng` codec builds on 1.88 (see its
+# manifest), and the CI `msrv` job verifies that lower floor.
+rust-version = "1.92"
 description = "Interactive bit-level PNG editor: inspect and edit the DEFLATE literals and LZ77 back-references that produced each pixel, then save the patched stream as a valid PNG."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

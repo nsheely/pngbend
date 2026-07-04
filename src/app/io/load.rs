@@ -5,7 +5,7 @@
 //! the UI thread. The app polls the result channel from its frame loop in
 //! [`super::super::PngBendApp::try_recv_load`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 
@@ -120,6 +120,14 @@ impl std::error::Error for LoadError {
     }
 }
 
+/// Filename for the status bar, falling back to the full path when the
+/// path has no final component.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// Estimate of the resident working set the loader will produce, in
 /// bytes. Surfaces a "this image will use ~X GB" hint in the status bar
 /// before the load starts so large images stay the user's call.
@@ -183,10 +191,7 @@ impl PngBendApp {
                 estimate_working_set_bytes(info.width, info.height, info.bpp),
             )
         });
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let name = display_name(&path);
         self.status = match est {
             Some((w, h, bytes)) => format!(
                 "Loading {name}  ·  {w}×{h}, ~{} working set…",
@@ -248,11 +253,7 @@ impl PngBendApp {
             // Status names the file and its broad shape; per-class
             // counts (Literals / Backrefs / All) live in the left
             // panel so the status bar doesn't duplicate them.
-            let name = loaded
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| loaded.path.display().to_string());
+            let name = display_name(&loaded.path);
             let warn = if loaded.warnings.is_empty() {
                 String::new()
             } else {

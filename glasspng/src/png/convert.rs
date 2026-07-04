@@ -61,6 +61,9 @@ impl std::error::Error for ConvertError {}
 /// Palette entry: RGBA, with alpha defaulting to 255 when no tRNS is present.
 pub type PaletteEntry = [u8; 4];
 
+/// An index outside the palette decodes to transparent black (PNG spec).
+const OOB_PALETTE: PaletteEntry = [0, 0, 0, 0];
+
 /// Verify `unfiltered` has the full `h * (row_stride - 1)` bytes the
 /// row-walking code will read. Shared between [`to_rgba8`] and
 /// [`to_rgba8_rows_into`] so the contract is one definition.
@@ -174,7 +177,7 @@ fn to_rgba8_row_unchecked(
             let src_base = y * w;
             for i in 0..w {
                 let idx = unfiltered[src_base + i] as usize;
-                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let c = pal.get(idx).copied().unwrap_or(OOB_PALETTE);
                 let d = rgba_base + i * 4;
                 rgba[d..d + 4].copy_from_slice(&c);
             }
@@ -258,7 +261,7 @@ fn to_rgba8_row_unchecked(
             for i in 0..w {
                 let byte = unfiltered[src_base + i / 8];
                 let idx = ((byte >> (7 - (i % 8))) & 1) as usize;
-                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let c = pal.get(idx).copied().unwrap_or(OOB_PALETTE);
                 let d = rgba_base + i * 4;
                 rgba[d..d + 4].copy_from_slice(&c);
             }
@@ -269,7 +272,7 @@ fn to_rgba8_row_unchecked(
             for i in 0..w {
                 let byte = unfiltered[src_base + i / 4];
                 let idx = ((byte >> ((3 - (i % 4)) * 2)) & 0x3) as usize;
-                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let c = pal.get(idx).copied().unwrap_or(OOB_PALETTE);
                 let d = rgba_base + i * 4;
                 rgba[d..d + 4].copy_from_slice(&c);
             }
@@ -280,7 +283,7 @@ fn to_rgba8_row_unchecked(
             for i in 0..w {
                 let byte = unfiltered[src_base + i / 2];
                 let idx = ((byte >> ((1 - (i % 2)) * 4)) & 0xF) as usize;
-                let c = pal.get(idx).copied().unwrap_or([0, 0, 0, 0]);
+                let c = pal.get(idx).copied().unwrap_or(OOB_PALETTE);
                 let d = rgba_base + i * 4;
                 rgba[d..d + 4].copy_from_slice(&c);
             }

@@ -1,3 +1,18 @@
+//! The editor application: `PngBendApp`, its per-frame `eframe::App::ui` loop,
+//! and the state it drives.
+//!
+//! State is split five ways so the frame loop can borrow the pieces
+//! independently: `Document` (the file on disk + undo history), `ViewState`
+//! (frame pixels, overlays, the composited texture), `ListState` (the
+//! left-panel filter), `Selection` (the clicked pixel and its derived edit
+//! options), and `AsyncOps` (background load + dialog channels).
+//!
+//! The `eframe::App::ui` impl is the readable spine: each frame it handles
+//! input, polls the async channels, rebuilds the texture when dirty, and draws
+//! the panels. The submodules hold the pieces: `io` (load/save), `select` +
+//! `edit` (the glitch pipeline), `nav`, `list_filter`, `overlay_cache`,
+//! `row_text`, `ui`, and `history`.
+
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -6,9 +21,9 @@ use crate::index::CascadeScratch;
 
 mod edit;
 mod history;
+mod input;
 mod io;
 mod list_filter;
-mod nav;
 mod overlay_cache;
 mod row_text;
 mod select;
@@ -67,7 +82,7 @@ pub(in crate::app) struct ViewState {
 
 /// The predicate a `rebuild_filter` ran, kept so the next call can detect a
 /// refinement and re-test only the current view. The three parts describe one
-/// rebuild, so they travel as a unit — present together or absent together.
+/// rebuild, so they travel as a unit: present together or absent together.
 struct FilterSnapshot {
     spec: FilterSpec,
     editable_only: bool,
@@ -147,6 +162,11 @@ pub struct PngBendApp {
     pub(in crate::app) show_about: bool,
 }
 
+/// Row-major index of `xy` into a `w`-wide map (`filtered_idx`).
+fn pixel_lin(xy: PixelXY, w: usize) -> usize {
+    xy.y as usize * w + xy.x as usize
+}
+
 impl PngBendApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         // Only four fields need non-Default starting values; everything
@@ -179,9 +199,7 @@ impl PngBendApp {
     /// neither site has to remember the full list.
     pub(super) fn reset_for_new_file(&mut self) {
         self.sel.sel_pixel = None;
-        self.sel.backref_src = None;
-        self.sel.selected_edit = None;
-        self.sel.edit_options.clear();
+        self.reset_edit_state();
         self.doc.history.clear();
         self.view.overlay_cache.clear();
         self.view.cascade_rgba = None;
@@ -227,7 +245,7 @@ impl PngBendApp {
     pub(super) fn filtered_pos(&self, xy: PixelXY) -> Option<usize> {
         let c = self.doc.core.as_ref()?;
         let w = c.info.width as usize;
-        let idx = xy.y as usize * w + xy.x as usize;
+        let idx = pixel_lin(xy, w);
         let slot = self.list.filtered_idx.get(idx).copied()?;
         (slot != u32::MAX).then_some(slot as usize)
     }
@@ -276,7 +294,7 @@ impl PngBendApp {
         } else {
             for f in &self.list.filtered_view {
                 let xy = f.resolve(pi).xy();
-                let idx = xy.y as usize * w + xy.x as usize;
+                let idx = pixel_lin(xy, w);
                 if let Some(slot) = self.list.filtered_idx.get_mut(idx) {
                     *slot = u32::MAX;
                 }
@@ -323,7 +341,7 @@ impl PngBendApp {
         // Write the new indices back.
         for (i, f) in self.list.filtered_view.iter().enumerate() {
             let xy = f.resolve(pi).xy();
-            let idx = xy.y as usize * w + xy.x as usize;
+            let idx = pixel_lin(xy, w);
             if let Some(slot) = self.list.filtered_idx.get_mut(idx) {
                 *slot = i as u32;
             }

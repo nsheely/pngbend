@@ -55,7 +55,7 @@ A Cargo workspace: a codec crate plus the editor that drives it.
 ```
 glasspng/                 # zero-dependency PNG codec (the "glass box")
 └── src/
-    ├── api.rs            # decode / decode_strict / encode; Image / GlassBox
+    ├── api/              # decode / decode_strict / encode; Image / GlassBox
     ├── bitstream.rs      # LSB-first bit reader/writer
     ├── coords.rs         # OutPos / PixelXY pixel↔byte geometry
     ├── raster.rs         # pass-aware projection (progressive + Adam7)

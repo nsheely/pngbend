@@ -1,3 +1,7 @@
+//! Per-frame input handling: keyboard navigation through the pixel list,
+//! keyboard shortcuts (open / undo / redo / save), and dropped-file opening.
+//! Driven from the `eframe::App::ui` loop before the panels are drawn.
+
 use super::PngBendApp;
 use super::select::SelectSource;
 
@@ -23,9 +27,7 @@ impl PngBendApp {
 
         if esc {
             self.sel.sel_pixel = None;
-            self.sel.selected_edit = None;
-            self.sel.edit_options.clear();
-            self.sel.backref_src = None;
+            self.reset_edit_state();
             self.view.cascade_rgba = None;
             self.sel.info_text = "Click a pixel to inspect it.".to_string();
             self.view.texture_dirty = true;
@@ -113,24 +115,5 @@ impl PngBendApp {
         {
             self.open_path(path);
         }
-    }
-
-    pub(super) fn ensure_overlay_cached(&mut self) {
-        let Some(c) = self.doc.core.as_ref() else {
-            return;
-        };
-        let Some(overlay) = self.view.overlay_mode.event_overlay() else {
-            return;
-        };
-        // The Literals/Distance/Blocks overlays paint pixels via the
-        // progressive layout, so they're skipped for interlaced images (the
-        // base image still renders).
-        if !c.overlays_supported() {
-            return;
-        }
-        let info = c.info;
-        self.view
-            .overlay_cache
-            .ensure(overlay, &c.events, &info, &c.block_starts, c.max_distance);
     }
 }

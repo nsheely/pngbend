@@ -18,7 +18,7 @@ pub struct SymCode {
 /// bits)`, indexed directly by symbol. Lit blocks have alphabet 0..=287,
 /// dist blocks 0..=29.
 ///
-/// `clen == 0` is the sentinel for "symbol not present in this block";
+/// `len == 0` is the sentinel for "symbol not present in this block";
 /// unambiguous because DEFLATE never assigns a zero-length code to a
 /// present symbol (1 bit is the minimum).
 ///
@@ -33,7 +33,7 @@ pub struct EncTable {
 
 impl EncTable {
     /// Table for an `n_symbols` alphabet; all symbols start absent
-    /// (`clen == 0`).
+    /// (`len == 0`).
     pub fn new(n_symbols: usize) -> Self {
         Self {
             entries: vec![SymCode::default(); n_symbols].into_boxed_slice(),
@@ -43,9 +43,9 @@ impl EncTable {
     /// Insert or overwrite `sym`'s entry. No-op if `sym` is outside the
     /// table's alphabet.
     #[inline]
-    pub fn set(&mut self, sym: u16, code: u16, clen: u8) {
+    pub fn set(&mut self, sym: u16, code: u16, len: u8) {
         if let Some(slot) = self.entries.get_mut(sym as usize) {
-            *slot = SymCode { code, len: clen };
+            *slot = SymCode { code, len };
         }
     }
 

@@ -12,7 +12,7 @@ use egui::Color32;
 
 use crate::coords::{OutPos, PixelXY};
 use crate::deflate::{EncTable, Event, RefEvent, SymCode, block_of};
-use crate::index::{CascadeScratch, PixelRow, event_at, valid_dist_alts};
+use crate::index::{CascadeScratch, DistAlt, PixelRow, event_at, valid_dist_alts};
 use crate::overlays::{compute_filter_expansion, make_cascade_overlay_bytes};
 
 use super::PngBendApp;
@@ -339,14 +339,19 @@ fn build_ref_redirect_edits(
     r: &RefEvent,
     block: u32,
     ch_name: &str,
-    alts: &[(u8, u32, u32)],
+    alts: &[DistAlt],
 ) -> Vec<EditOption> {
     let de = &c.dist_encs[block as usize];
     let old_len = de.get(r.dist_sym as u16).map_or(0, |c| c.len);
     let dist = r.out_pos - r.src_out_pos;
 
     alts.iter()
-        .filter_map(|&(new_dsym, new_src, new_dist)| {
+        .filter_map(
+            |&DistAlt {
+                 dist_sym: new_dsym,
+                 src_out_pos: new_src,
+                 distance: new_dist,
+             }| {
             let SymCode {
                 code: new_code,
                 len: new_len,
@@ -408,7 +413,8 @@ fn preview_color(preview: &[u8]) -> Color32 {
 
 /// Literal symbols in `le` that share `val`'s Huffman code length (so
 /// swapping one in keeps the bitstream length unchanged), excluding `val`
-/// itself. The single source of the same-length-swap rule for literals.
+/// itself. The enumeration form of the same-length-swap rule; the pixel-index
+/// build (`precompute_lit_swap_syms`) encodes the same rule as a bitset.
 fn same_len_lit_swaps(le: &EncTable, val: u16) -> impl Iterator<Item = u16> + '_ {
     let clen = le.get(val).map_or(0, |c| c.len);
     le.iter()

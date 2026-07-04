@@ -1,8 +1,13 @@
+//! Single-slot cache for the event-driven overlay buffers (Literals /
+//! Distance / Blocks), keyed by which one is currently shown.
+
 use crate::deflate::Event;
 use crate::overlays::{
     make_block_overlay_bytes, make_distance_overlay_bytes, make_literal_overlay_bytes,
 };
 use crate::png::PngInfo;
+
+use super::PngBendApp;
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
 pub(super) enum OverlayMode {
@@ -15,8 +20,8 @@ pub(super) enum OverlayMode {
 }
 
 impl OverlayMode {
-    /// All modes the user can pick in the UI. Use as the single source of
-    /// truth for the overlay selector and any `match` / `ensure` sites.
+    /// All modes the user can pick in the UI. The overlay selector and the
+    /// `match` / `ensure` sites iterate this rather than re-listing the variants.
     pub const ALL: [OverlayMode; 5] = [
         OverlayMode::None,
         OverlayMode::Literals,
@@ -48,10 +53,10 @@ impl OverlayMode {
     }
 }
 
-/// The overlays rendered from the event stream and cached — exactly the
-/// cacheable subset of [`OverlayMode`] (which also has `None` and the
-/// per-click `Cascade`). Keying [`OverlayCache`] on this makes the "only these
-/// three" rule a type rather than a runtime guard.
+/// The overlays rendered from the event stream and cached: the cacheable
+/// subset of [`OverlayMode`] (which also has `None` and the per-click
+/// `Cascade`). Keying [`OverlayCache`] on this makes the "only these three"
+/// rule a type rather than a runtime guard.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub(super) enum EventOverlay {
     Literals,
@@ -123,5 +128,26 @@ impl OverlayCache {
             self.entry = Some((overlay, bytes));
         }
         self.entry.as_ref().map(|(_, bytes)| bytes)
+    }
+}
+
+impl PngBendApp {
+    /// Ensure the current overlay mode's buffer is cached before the texture
+    /// rebuild reads it. No-op for `None` / `Cascade` (no event-driven buffer)
+    /// and for interlaced images (overlays are progressive-only).
+    pub(super) fn ensure_overlay_cached(&mut self) {
+        let Some(c) = self.doc.core.as_ref() else {
+            return;
+        };
+        let Some(overlay) = self.view.overlay_mode.event_overlay() else {
+            return;
+        };
+        if !c.overlays_supported() {
+            return;
+        }
+        let info = c.info;
+        self.view
+            .overlay_cache
+            .ensure(overlay, &c.events, &info, &c.block_starts, c.max_distance);
     }
 }

@@ -22,8 +22,8 @@ use pngbend::bitstream::{read_bits_at, write_bits};
 use pngbend::composite::{composite_rgba, composite_rows_into};
 use pngbend::deflate::{EncTable, Event, block_of, decode_deflate};
 use pngbend::index::{
-    CascadeScratch, PixelIndex, PixelRow, build_pixel_index, build_pos_to_ev, build_reverse_graph,
-    valid_dist_alts,
+    CascadeScratch, DistAlt, PixelIndex, PixelRow, build_pixel_index, build_pos_to_ev,
+    build_reverse_graph, valid_dist_alts,
 };
 use pngbend::overlays::{
     compute_filter_expansion, make_block_overlay_bytes, make_cascade_overlay_bytes,
@@ -908,10 +908,14 @@ fn find_redirect_swaps(
         let Event::Ref(r) = e else { continue };
         let block = block_of(block_starts, i as u32);
         let alts = valid_dist_alts(block, r.dist_sym, r.out_pos, r.src_out_pos, dist_encs);
-        let &(new_dsym, new_src, _new_dist) = alts.first().unwrap_or(&(0, 0, 0));
         if alts.is_empty() {
             continue;
         }
+        let DistAlt {
+            dist_sym: new_dsym,
+            src_out_pos: new_src,
+            ..
+        } = alts[0];
         let de = &dist_encs[block as usize];
         let Some(sc) = de.get(new_dsym as u16) else {
             continue;

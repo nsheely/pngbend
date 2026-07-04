@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use pngbend::bitstream::{read_bits_at, write_bits};
 use pngbend::deflate::{Event, block_of, decode_deflate, inflate};
-use pngbend::index::{build_pos_to_ev, build_reverse_graph, valid_dist_alts};
+use pngbend::index::{DistAlt, build_pos_to_ev, build_reverse_graph, valid_dist_alts};
 use pngbend::png::{
     ChunkType, Warning, concat_idat, parse_ihdr, read_chunks, unfilter, unfilter_rows_into,
 };
@@ -323,7 +323,9 @@ fn incremental_redirect_unfilter_matches_full_decode() {
                     r.src_out_pos,
                     &decoded.dist_encs,
                 );
-                let &(new_sym, _new_src, _new_dist) = alts.first()?;
+                let &DistAlt {
+                    dist_sym: new_sym, ..
+                } = alts.first()?;
                 let de = &decoded.dist_encs[block as usize];
                 let sc = de.get(new_sym as u16)?;
                 let (new_code, new_clen) = (sc.code, sc.len);
@@ -495,7 +497,11 @@ fn surgical_redirect_output_matches_full_decode() {
                     r.src_out_pos,
                     &decoded.dist_encs,
                 );
-                let &(new_sym, new_src, _new_dist) = alts.first()?;
+                let &DistAlt {
+                    dist_sym: new_sym,
+                    src_out_pos: new_src,
+                    ..
+                } = alts.first()?;
                 let de = &decoded.dist_encs[block as usize];
                 let sc = de.get(new_sym as u16)?;
                 let (new_code, new_clen) = (sc.code, sc.len);
@@ -590,7 +596,10 @@ fn surgical_redirect_apply_undo_round_trip_with_overlap() {
                     r.src_out_pos,
                     &decoded.dist_encs,
                 );
-                let &(_, new_src, _) = alts.first()?;
+                let &DistAlt {
+                    src_out_pos: new_src,
+                    ..
+                } = alts.first()?;
                 Some((
                     idx,
                     r.out_pos as usize,

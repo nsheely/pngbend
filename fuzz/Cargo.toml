@@ -1,5 +1,5 @@
 [package]
-name = "pngbend-fuzz"
+name = "glasspng-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -10,12 +10,21 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.pngbend]
-path = ".."
+# Fuzz the codec directly rather than through the editor: keeps the fuzz build
+# off the egui/wgpu stack and points the targets at glasspng's real public API.
+[dependencies.glasspng]
+path = "../glasspng"
 
 [[bin]]
-name = "fuzz_target_1"
-path = "fuzz_targets/fuzz_target_1.rs"
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 bench = false
